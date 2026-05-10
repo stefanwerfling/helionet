@@ -83,19 +83,32 @@ static uint8_t coderateCodeToCr(uint8_t c) {
     return (c >= 1 && c <= 4) ? (4 + c) : 5;
 }
 
+// SX1276 has two transmit output stages: PA_BOOST (higher power, separate pin)
+// and RFO (lower power, different pin). RadioLib defaults to PA_BOOST. If a
+// board's PA_BOOST trace is broken but RFO is intact, switching here brings
+// the radio back to life — at the cost of less output power and shorter
+// reach. RadioLib clamps the power to the valid range per path.
+#ifdef USE_RFO
+static constexpr bool kUseRfo = true;
+static constexpr const char* kPaName = "RFO";
+#else
+static constexpr bool kUseRfo = false;
+static constexpr const char* kPaName = "PA_BOOST";
+#endif
+
 static void applySettings(SX1276& r, const char* who, const LoraSettings& s) {
     int16_t e1 = r.setFrequency(s.freqMHz);
     int16_t e2 = r.setBandwidth(s.bwKHz);
     int16_t e3 = r.setSpreadingFactor(s.sf);
     int16_t e4 = r.setCodingRate(s.cr);
     int16_t e5 = r.setPreambleLength(s.preambleLen);
-    int16_t e6 = r.setOutputPower(s.power);
+    int16_t e6 = r.setOutputPower(s.power, kUseRfo);
     int16_t e7 = r.setSyncWord(s.syncWord);
     int16_t e8 = r.setCRC(s.crcOn);
-    Serial.printf("#apply[%s] f=%.2f bw=%.0f sf=%d cr=%d pre=%d pw=%d sync=0x%02X crc=%d "
+    Serial.printf("#apply[%s] f=%.2f bw=%.0f sf=%d cr=%d pre=%d pw=%d/%s sync=0x%02X crc=%d "
                   "errs=%d/%d/%d/%d/%d/%d/%d/%d\n",
-                  who, s.freqMHz, s.bwKHz, s.sf, s.cr, s.preambleLen, s.power, s.syncWord, s.crcOn,
-                  e1, e2, e3, e4, e5, e6, e7, e8);
+                  who, s.freqMHz, s.bwKHz, s.sf, s.cr, s.preambleLen, s.power, kPaName,
+                  s.syncWord, s.crcOn, e1, e2, e3, e4, e5, e6, e7, e8);
 }
 
 static uint32_t readU32LE(const uint8_t* p) {
