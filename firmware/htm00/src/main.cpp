@@ -211,16 +211,19 @@ static void handleConfigBody(const uint8_t* body, uint16_t len) {
 static void handleSendBody(const uint8_t* body, uint16_t len) {
     if (len == 0 || len > MAX_PAYLOAD) return;
 #ifdef USE_DUPLEX
-    // Park rxRadio so it doesn't pick up our own transmission via PCB
-    // coupling and emit a spurious #rxev. CH0/CH1 share the antenna ground
-    // path and on the same board the TX leaks at ~-43 dBm, easily strong
-    // enough to trip CH1's RX-Done. Standby disables the demodulator;
-    // re-arm when we're done.
-    rxRadio.standby();
+    // Self-echo only happens when CH0 (TX) and CH1 (RX) are on the same
+    // frequency: CH1 picks up the local TX via PCB coupling. In FDD mode
+    // CH1 is on a different frequency and will not demodulate the local
+    // CH0 carrier, so the guard would just blind us during TX while the
+    // peer is transmitting -> deadlock.
+    bool sameFreq = fabsf(tx.freqMHz - rx.freqMHz) < 0.01f;
+    if (sameFreq) rxRadio.standby();
     int16_t st = txRadio.transmit(const_cast<uint8_t*>(body), len);
-    Serial.printf("#tx n=%u st=%d\n", (unsigned)len, st);
-    int16_t sr = rxRadio.startReceive();
-    if (sr != RADIOLIB_ERR_NONE) Serial.printf("#rxon st=%d\n", sr);
+    Serial.printf("#tx n=%u st=%d sameFreq=%d\n", (unsigned)len, st, (int)sameFreq);
+    if (sameFreq) {
+        int16_t sr = rxRadio.startReceive();
+        if (sr != RADIOLIB_ERR_NONE) Serial.printf("#rxon st=%d\n", sr);
+    }
 #else
     if (fabsf(tx.freqMHz - rx.freqMHz) > 0.001f) txRadio.setFrequency(tx.freqMHz);
     int16_t st = txRadio.transmit(const_cast<uint8_t*>(body), len);
