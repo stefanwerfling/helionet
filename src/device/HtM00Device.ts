@@ -210,6 +210,12 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
         await this.sendConfig(body);
     }
 
+    /** Save WiFi credentials to the firmware's NVS and trigger reconnect.
+     *  Requires a WIFI_BRIDGE-build firmware on the board. */
+    public async setWifi(ssid: string, pass: string, hostname?: string): Promise<void> {
+        await this.sendConfig(buildWifiConfigBody(ssid, pass, hostname));
+    }
+
     public async setTxChannel(hz: number): Promise<void> {
         const body = Buffer.alloc(6);
         body.write('Tc', 0, 'ascii');
@@ -375,4 +381,22 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
 
 function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+/** Pack a "WC" CMD_CONFIG body: "WC" + u8 ssid_len + ssid + u8 pass_len + pass
+ *  + u8 host_len + host. Empty host_len falls back to the firmware default. */
+export function buildWifiConfigBody(ssid: string, pass: string, hostname = ''): Buffer {
+    const s = Buffer.from(ssid, 'utf-8');
+    const p = Buffer.from(pass, 'utf-8');
+    const h = Buffer.from(hostname, 'utf-8');
+    if (s.length > 255 || p.length > 255 || h.length > 255) {
+        throw new RangeError('ssid/pass/hostname must each be < 256 bytes utf-8');
+    }
+    const body = Buffer.alloc(2 + 1 + s.length + 1 + p.length + 1 + h.length);
+    let off = 0;
+    body.write('WC', off, 'ascii'); off += 2;
+    body.writeUInt8(s.length, off++); s.copy(body, off); off += s.length;
+    body.writeUInt8(p.length, off++); p.copy(body, off); off += p.length;
+    body.writeUInt8(h.length, off++); h.copy(body, off);
+    return body;
 }

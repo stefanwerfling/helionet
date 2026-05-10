@@ -14,6 +14,10 @@ firmware/htm00/.venv/
 firmware/htm00/backups/*.bin
 firmware/htm00/backups/*.sha256
 
+# Local WiFi credentials for the WIFI_BRIDGE build, generated from
+# WiFiCreds.h.example. Never commit.
+firmware/htm00/include/WiFiCreds.h
+
 # Heltec stock-firmware reverse-engineering workspace.
 # Keep the analysis tooling under _tools/ in the repo, but everything else
 # (downloaded vendor binaries, extracted segments, Ghidra project DB,

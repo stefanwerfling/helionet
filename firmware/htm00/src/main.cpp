@@ -17,6 +17,30 @@
 #include <U8g2lib.h>
 #include "Pins.h"
 
+#ifdef USE_WIFI_BRIDGE
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <WebServer.h>
+#include <Preferences.h>
+// WiFiCreds.h is optional: compile-time defaults. Runtime CMD_CONFIG "WC"
+// stores credentials in NVS and overrides these.
+#if __has_include("WiFiCreds.h")
+#  include "WiFiCreds.h"
+#endif
+#ifndef WIFI_SSID
+#  define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASS
+#  define WIFI_PASS ""
+#endif
+#ifndef WIFI_HOSTNAME
+#  define WIFI_HOSTNAME "helionet-htm00"
+#endif
+#ifndef BRIDGE_UDP_PORT
+#  define BRIDGE_UDP_PORT 7000
+#endif
+#endif
+
 constexpr uint8_t  CMD_SEND    = 0x01;
 constexpr uint8_t  CMD_CONFIG  = 0x02;
 constexpr uint8_t  CMD_DISPLAY = 0x03;
@@ -89,6 +113,38 @@ static constexpr const char* kModeName = "DUPLEX";
 static constexpr const char* kModeName = LORA_CH_NAME;
 #endif
 
+// ---------- Wire-protocol sink (USB-Serial OR WiFi-UDP) ----------
+// All of the firmware's "talk to host" calls go through these helpers, so the
+// rest of the code doesn't have to know whether it sits on USB or on WiFi.
+#ifdef USE_WIFI_BRIDGE
+static WiFiUDP    udpBridge;
+static WebServer  http(80);
+static IPAddress  hostIp;             // last UDP peer that talked to us
+static uint16_t   hostPort = 0;
+static bool       wifiOk = false;
+static Preferences wifiPrefs;
+// Live values, populated from NVS (with WIFI_SSID/PASS/HOSTNAME as fallback).
+static String     cfgSsid;
+static String     cfgPass;
+static String     cfgHost;
+// Forward decl so handleConfigBody can call the bigger reconfigure helper
+// that's defined further down in the WiFi-bridge block.
+static void handleWifiConfig(const uint8_t* body, uint16_t len);
+#endif
+
+static void sendToHost(const uint8_t* data, size_t len) {
+#ifdef USE_WIFI_BRIDGE
+    if (wifiOk && hostPort != 0) {
+        udpBridge.beginPacket(hostIp, hostPort);
+        udpBridge.write(data, len);
+        udpBridge.endPacket();
+    }
+#else
+    Serial.write(data, len);
+    Serial.flush();
+#endif
+}
+
 static float bandwidthCodeToKHz(uint8_t c) {
     return c == 1 ? 250.0f : c == 2 ? 500.0f : 125.0f;
 }
@@ -130,8 +186,7 @@ static uint32_t readU32LE(const uint8_t* p) {
 }
 
 static void replyConfigOk(void) {
-    Serial.write(reinterpret_cast<const uint8_t*>("CONFIG_OK"), 9);
-    Serial.flush();
+    sendToHost(reinterpret_cast<const uint8_t*>("CONFIG_OK"), 9);
 }
 
 // ---------- OLED ----------
@@ -167,6 +222,21 @@ static void redrawOled(void) {
         oled.setCursor(0, y); oled.print("S --");
         y += OLED_LINE_H;
     }
+
+#ifdef USE_WIFI_BRIDGE
+    oled.setCursor(0, y);
+    oled.printf("WiFi %s", wifiOk ? "up" : "...");
+    y += OLED_LINE_H;
+    if (wifiOk) {
+        // IP needs up to 15 chars ("192.168.123.234"); the 6x10 default font
+        // only fits 10 chars across 64 px, so drop to 5x7 for this line.
+        oled.setFont(u8g2_font_5x7_tf);
+        oled.setCursor(0, y);
+        oled.print(WiFi.localIP().toString().c_str());
+        y += 8;
+        oled.setFont(u8g2_font_6x10_tf);
+    }
+#endif
 
     // Separator + free-form host text (CMD_DISPLAY).
     oled.drawHLine(0, y - OLED_LINE_H + 2, OLED_W);
@@ -259,6 +329,11 @@ static void handleConfigBody(const uint8_t* body, uint16_t len) {
         tx.freqMHz = readU32LE(body + 2) / 1000000.0f;
         txRadio.setFrequency(tx.freqMHz);
         replyConfigOk();
+#ifdef USE_WIFI_BRIDGE
+    } else if (body[0] == 'W' && body[1] == 'C') {
+        handleWifiConfig(body + 2, len - 2);
+        replyConfigOk();
+#endif
     }
 }
 
@@ -343,11 +418,209 @@ static void emitReceivedFrame(SX1276& r) {
         lastRssi = rssi;
         lastSnr  = snr;
         hasLastRx = true;
-        Serial.write(buf, len);
-        Serial.flush();
+        sendToHost(buf, len);
     }
     r.startReceive();
 }
+
+// ---------- WiFi-Bridge: WiFi connect, UDP server, HTTP/WebUI ----------
+#ifdef USE_WIFI_BRIDGE
+
+static const char kIndexHtml[] PROGMEM = R"HTML(<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>helionet | %MODE%</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ body{font-family:system-ui,sans-serif;background:#0c1116;color:#e6edf3;margin:0;padding:0}
+ header{background:#161b22;padding:1rem 1.5rem;border-bottom:1px solid #30363d}
+ header h1{margin:0;font-size:1.1rem}
+ header span{color:#7d8590;font-size:.85rem;margin-left:.5rem}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;padding:1.5rem}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:.5rem;padding:1rem}
+ .card h2{margin:0 0 .5rem;font-size:.7rem;color:#7d8590;text-transform:uppercase;letter-spacing:.05em}
+ .card .v{font-size:1.6rem;font-weight:600}
+ .card .u{color:#7d8590;font-size:.85rem;margin-left:.25rem}
+ form{padding:0 1.5rem 1.5rem;display:flex;gap:.5rem}
+ input,button{padding:.5rem .75rem;border-radius:.3rem;border:1px solid #30363d;background:#0d1117;color:#e6edf3;font:inherit}
+ input{flex:1}
+ button{background:#238636;border-color:#238636;cursor:pointer}
+ button:hover{background:#2ea043}
+ .ok{color:#3fb950}
+ .bad{color:#f85149}
+</style></head>
+<body>
+<header><h1>helionet HT-M00 <span>%MODE% &middot; %IP%</span></h1></header>
+<div class="grid" id="g"></div>
+<form id="f" action="/display" method="post">
+  <input type="text" name="t" placeholder="display text&hellip;" maxlength="200" required>
+  <button>Show</button>
+</form>
+<script>
+async function tick(){
+  const r = await fetch('/stats').then(x=>x.json()).catch(()=>null);
+  if(!r) return;
+  const cells = [
+    ['Mode', r.mode, ''],
+    ['Frequency', r.freqMHz.toFixed(1), 'MHz'],
+    ['TX frames', r.txCount, ''],
+    ['RX frames', r.rxCount, ''],
+    ['Last RSSI', r.hasLastRx? r.lastRssi : '--', 'dBm'],
+    ['Last SNR',  r.hasLastRx? r.lastSnr.toFixed(1) : '--', 'dB'],
+    ['Uptime', Math.floor(r.uptimeMs/1000), 's'],
+    ['Host', r.hostIp + ':' + r.hostPort, ''],
+  ];
+  document.getElementById('g').innerHTML = cells.map(c=>
+    `<div class="card"><h2>${c[0]}</h2><div class="v">${c[1]}<span class="u">${c[2]}</span></div></div>`
+  ).join('');
+}
+tick(); setInterval(tick, 1000);
+</script>
+</body></html>)HTML";
+
+static String renderIndex() {
+    String html = FPSTR(kIndexHtml);
+    html.replace("%MODE%", kModeName);
+    html.replace("%IP%", WiFi.localIP().toString());
+    return html;
+}
+
+static void httpStats() {
+    char buf[480];
+    snprintf(buf, sizeof(buf),
+        "{\"mode\":\"%s\",\"freqMHz\":%.3f,\"txCount\":%lu,\"rxCount\":%lu,"
+        "\"lastRssi\":%.1f,\"lastSnr\":%.2f,\"hasLastRx\":%s,\"uptimeMs\":%lu,"
+        "\"hostIp\":\"%s\",\"hostPort\":%u,\"display\":\"%s\"}",
+        kModeName, tx.freqMHz, (unsigned long)txCount, (unsigned long)rxCount,
+        lastRssi, lastSnr, hasLastRx ? "true" : "false", (unsigned long)millis(),
+        hostIp.toString().c_str(), hostPort, displayText);
+    http.send(200, "application/json", buf);
+}
+
+static void httpDisplay() {
+    if (http.hasArg("t")) {
+        const String& t = http.arg("t");
+        size_t n = t.length();
+        if (n >= DISPLAY_BUF_SIZE) n = DISPLAY_BUF_SIZE - 1;
+        memcpy(displayText, t.c_str(), n);
+        displayText[n] = '\0';
+        redrawOled();
+    }
+    http.sendHeader("Location", "/");
+    http.send(303, "text/plain", "");
+}
+
+static void loadWifiConfig(void) {
+    wifiPrefs.begin("helio-wifi", true);     // read-only
+    cfgSsid = wifiPrefs.getString("ssid", WIFI_SSID);
+    cfgPass = wifiPrefs.getString("pass", WIFI_PASS);
+    cfgHost = wifiPrefs.getString("host", WIFI_HOSTNAME);
+    wifiPrefs.end();
+}
+
+static void saveWifiConfig(const String& ssid, const String& pass, const String& host) {
+    wifiPrefs.begin("helio-wifi", false);
+    wifiPrefs.putString("ssid", ssid);
+    wifiPrefs.putString("pass", pass);
+    wifiPrefs.putString("host", host);
+    wifiPrefs.end();
+    cfgSsid = ssid;
+    cfgPass = pass;
+    cfgHost = host;
+}
+
+static bool connectWifi(void) {
+    wifiOk = false;
+    if (cfgSsid.length() == 0) {
+        Serial.println("#wifi no SSID configured — waiting for CMD_CONFIG \"WC\"");
+        return false;
+    }
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(cfgHost.c_str());
+    Serial.printf("#wifi connecting to '%s' as %s\n", cfgSsid.c_str(), cfgHost.c_str());
+    WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+    unsigned long deadline = millis() + 20000;
+    while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
+        delay(250);
+        Serial.print('.');
+    }
+    Serial.println();
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("#wifi FAILED");
+        return false;
+    }
+    wifiOk = true;
+    IPAddress ip = WiFi.localIP();
+    Serial.printf("#wifi up: ip=%s rssi=%d\n", ip.toString().c_str(), WiFi.RSSI());
+    return true;
+}
+
+static void handleWifiConfig(const uint8_t* body, uint16_t len) {
+    // Body format: u8 ssid_len + ssid + u8 pass_len + pass + u8 host_len + host
+    if (len < 3) return;
+    size_t off = 0;
+    uint8_t ssidLen = body[off++];
+    if (off + ssidLen + 1 > len) return;
+    String ssid(reinterpret_cast<const char*>(body + off), ssidLen);
+    off += ssidLen;
+    uint8_t passLen = body[off++];
+    if (off + passLen + 1 > len) return;
+    String pass(reinterpret_cast<const char*>(body + off), passLen);
+    off += passLen;
+    uint8_t hostLen = body[off++];
+    if (off + hostLen > len) return;
+    String host = hostLen > 0
+        ? String(reinterpret_cast<const char*>(body + off), hostLen)
+        : String(WIFI_HOSTNAME);
+
+    Serial.printf("#wifi saving config: ssid='%s' host='%s'\n", ssid.c_str(), host.c_str());
+    saveWifiConfig(ssid, pass, host);
+
+    // Tear down old connection and reconnect.
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect(true);
+        delay(100);
+    }
+    if (connectWifi()) {
+        udpBridge.stop();
+        udpBridge.begin(BRIDGE_UDP_PORT);
+        http.stop();
+        http.begin();
+        Serial.println("#wifi reconfigured + UDP/HTTP restarted");
+    }
+}
+
+static void initBridgeWifi(void) {
+    loadWifiConfig();
+    if (!connectWifi()) {
+        // Without WiFi the UDP listener is useless, but the parser stays alive
+        // over Serial so the host can still push a WC config to us.
+        return;
+    }
+
+    udpBridge.begin(BRIDGE_UDP_PORT);
+    Serial.printf("#udp listening on %d\n", BRIDGE_UDP_PORT);
+
+    http.on("/", []() { http.send(200, "text/html", renderIndex()); });
+    http.on("/stats", httpStats);
+    http.on("/display", HTTP_POST, httpDisplay);
+    http.begin();
+    Serial.println("#http listening on 80");
+}
+
+static void pumpBridge(void) {
+    if (!wifiOk) return;
+    int sz = udpBridge.parsePacket();
+    if (sz > 0) {
+        // Remember who's talking to us so reply frames can find their way back.
+        hostIp = udpBridge.remoteIP();
+        hostPort = udpBridge.remotePort();
+        uint8_t buf[1500];
+        int n = udpBridge.read(buf, sizeof(buf));
+        for (int i = 0; i < n; i++) feedParser(buf[i]);
+    }
+    http.handleClient();
+}
+#endif // USE_WIFI_BRIDGE
 
 void setup(void) {
     Serial.begin(115200);
@@ -396,9 +669,19 @@ void setup(void) {
     int16_t sr = radio.startReceive();
     Serial.printf("#rxon-init st=%d\n", sr);
 #endif
+
+#ifdef USE_WIFI_BRIDGE
+    initBridgeWifi();
+#endif
 }
 
 void loop(void) {
+#ifdef USE_WIFI_BRIDGE
+    // In bridge builds the wire-protocol input arrives over UDP, but we still
+    // accept Serial as a backup so the board stays steerable over USB if WiFi
+    // is down or you want to send a CMD_DISPLAY locally.
+    pumpBridge();
+#endif
     while (Serial.available()) feedParser((uint8_t)Serial.read());
 #ifdef USE_DUPLEX
     if (packetReady0) {

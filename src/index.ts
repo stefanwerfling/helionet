@@ -12,6 +12,7 @@ export {
     verifyCrc,
     FLAG_COMPRESS,
     FLAG_CIPHER,
+    FLAG_AEAD,
     ADDR_MASK,
     HEADER_SIZE,
     ADDR_FLAGS_SIZE,
@@ -21,6 +22,16 @@ export {
     type EncodeInput,
     type DecodeResult,
 } from './frame/Ip2LoraCodec.js';
+
+export {
+    AEAD_KEY_LEN,
+    AEAD_NONCE_LEN,
+    AEAD_TAG_LEN,
+    NonceCounter,
+    ReplayWindow,
+    aeadEncrypt,
+    aeadDecrypt,
+} from './frame/AeadCodec.js';
 
 export {
     zlibCompress,
@@ -47,6 +58,11 @@ export {
     HtM00Device,
     type HtM00DeviceOptions,
 } from './device/HtM00Device.js';
+
+export {
+    WiFiUdpDevice,
+    type WiFiUdpDeviceOptions,
+} from './device/WiFiUdpDevice.js';
 
 export {
     MockLoopbackDevice,

@@ -16,6 +16,15 @@ import {
     verifyCrc,
 } from '../frame/Ip2LoraCodec.js';
 import { XorCipher } from '../frame/XorCipher.js';
+import {
+    AEAD_KEY_LEN,
+    AEAD_NONCE_LEN,
+    AEAD_TAG_LEN,
+    NonceCounter,
+    ReplayWindow,
+    aeadDecrypt,
+    aeadEncrypt,
+} from '../frame/AeadCodec.js';
 import { zlibCompress, zlibDecompress } from '../compress/ZlibCodec.js';
 import { RohcCodec } from '../compress/RohcCodec.js';
 import {
@@ -33,7 +42,12 @@ export interface Ip2LoraTunnelOptions {
     maxLoraFrameSize: number;
     txConfig: RadioTxConfig;
     rxConfig: RadioRxConfig;
+    /** Legacy XOR cipher key — kept for compat with upstream IP2LoRa firmware. */
     cipherKey?: Uint8Array | string;
+    /** ChaCha20-Poly1305 key (32 bytes). When set, every outgoing frame is
+     *  AEAD-encrypted; incoming frames with FLAG_AEAD are verified + decrypted
+     *  and replay-checked. Strongly recommended over XOR. */
+    aeadKey?: Uint8Array;
     useZlib?: boolean;
     useRohc?: boolean;
 }
@@ -44,6 +58,9 @@ export class Ip2LoraTunnel extends EventEmitter {
     private readonly cipher?: XorCipher;
     private readonly rohc?: RohcCodec;
     private readonly useZlib: boolean;
+    private readonly aeadKey?: Buffer;
+    private readonly nonceCounter?: NonceCounter;
+    private readonly replayWindows = new Map<number, ReplayWindow>();
     private tun?: Tun;
     private rxBuffer: Uint8Array = new Uint8Array(0);
     private running = false;
@@ -65,6 +82,13 @@ export class Ip2LoraTunnel extends EventEmitter {
         if (opts.cipherKey !== undefined) {
             this.cipher = new XorCipher(opts.cipherKey);
         }
+        if (opts.aeadKey !== undefined) {
+            if (opts.aeadKey.length !== AEAD_KEY_LEN) {
+                throw new RangeError(`aeadKey must be ${AEAD_KEY_LEN} bytes, got ${opts.aeadKey.length}`);
+            }
+            this.aeadKey = Buffer.from(opts.aeadKey);
+            this.nonceCounter = new NonceCounter();
+        }
         if (opts.useRohc) {
             this.rohc = new RohcCodec();
         }
@@ -72,6 +96,12 @@ export class Ip2LoraTunnel extends EventEmitter {
 
         this.boundOnSerial = (chunk) => this.onSerialBytes(chunk);
         this.boundOnTun = (chunk) => this.onTunPacket(chunk);
+    }
+
+    private replayWindowFor(peerAddr: number): ReplayWindow {
+        let w = this.replayWindows.get(peerAddr);
+        if (!w) { w = new ReplayWindow(); this.replayWindows.set(peerAddr, w); }
+        return w;
     }
 
     public async start(): Promise<void> {
@@ -157,9 +187,27 @@ export class Ip2LoraTunnel extends EventEmitter {
             cipherFlag = true;
         }
 
+        let aeadFlag = false;
+        if (this.aeadKey && this.nonceCounter) {
+            // AAD = the addr|flags byte that's about to be on the wire, with
+            // FLAG_AEAD set so the receiver doesn't have to guess.
+            let aadByte = (addr & ADDR_MASK);
+            if (compressFlag) aadByte |= 0x80;
+            if (cipherFlag)   aadByte |= 0x40;
+            aadByte |= 0x20;   // FLAG_AEAD
+            const nonce = this.nonceCounter.next();
+            const aad = Buffer.from([aadByte]);
+            const enc = aeadEncrypt(this.aeadKey, nonce, Buffer.from(wirePayload), aad);
+            wirePayload = new Uint8Array(AEAD_NONCE_LEN + enc.ciphertext.length + AEAD_TAG_LEN);
+            wirePayload.set(nonce, 0);
+            wirePayload.set(enc.ciphertext, AEAD_NONCE_LEN);
+            wirePayload.set(enc.tag, AEAD_NONCE_LEN + enc.ciphertext.length);
+            aeadFlag = true;
+        }
+
         const frame = encodeFrame({
             addr,
-            flags: { compress: compressFlag, cipher: cipherFlag },
+            flags: { compress: compressFlag, cipher: cipherFlag, aead: aeadFlag },
             wirePayload,
             clearPayload,
         });
@@ -196,14 +244,18 @@ export class Ip2LoraTunnel extends EventEmitter {
                 continue;
             }
 
-            const clear = this.recoverClearPayload(res.wirePayload, res.flags);
+            const clear = this.recoverClearPayload(
+                res.wirePayload, res.flags, res.addrFlagsByte, res.addr,
+            );
             if (!clear) {
-                this.emit('drop', { where: 'recover-failed' });
+                // recoverClearPayload already emitted a more specific drop.
                 i += 1;
                 continue;
             }
 
-            if (!verifyCrc(res.addrFlagsByte, clear, res.claimedCrc)) {
+            // CRC check still useful as a cheap pre-filter for the
+            // non-AEAD path. AEAD's auth tag is the real integrity check.
+            if (!res.flags.aead && !verifyCrc(res.addrFlagsByte, clear, res.claimedCrc)) {
                 this.emit('drop', { where: 'crc-mismatch', addr: res.addr });
                 i += 1;
                 continue;
@@ -218,13 +270,38 @@ export class Ip2LoraTunnel extends EventEmitter {
 
     private recoverClearPayload(
         wire: Uint8Array,
-        flags: { compress: boolean; cipher: boolean },
+        flags: { compress: boolean; cipher: boolean; aead: boolean },
+        addrFlagsByte: number,
+        peerAddr: number,
     ): Uint8Array | undefined {
         let buf = wire;
-        if (flags.cipher) {
-            if (!this.cipher) {
+        if (flags.aead) {
+            if (!this.aeadKey) {
+                this.emit('drop', { where: 'aead-required-but-no-key', addr: peerAddr });
                 return undefined;
             }
+            if (buf.length < AEAD_NONCE_LEN + AEAD_TAG_LEN) {
+                this.emit('drop', { where: 'aead-short', len: buf.length });
+                return undefined;
+            }
+            const nonce = Buffer.from(buf.subarray(0, AEAD_NONCE_LEN));
+            const ct    = Buffer.from(buf.subarray(AEAD_NONCE_LEN, buf.length - AEAD_TAG_LEN));
+            const tag   = Buffer.from(buf.subarray(buf.length - AEAD_TAG_LEN));
+            const aad   = Buffer.from([addrFlagsByte]);
+            const window = this.replayWindowFor(peerAddr);
+            if (!window.check(nonce)) {
+                this.emit('drop', { where: 'aead-replay', addr: peerAddr });
+                return undefined;
+            }
+            try {
+                buf = aeadDecrypt(this.aeadKey, nonce, ct, tag, aad);
+            } catch {
+                this.emit('drop', { where: 'aead-tag-mismatch', addr: peerAddr });
+                return undefined;
+            }
+        }
+        if (flags.cipher) {
+            if (!this.cipher) return undefined;
             buf = this.cipher.apply(buf);
         }
         if (flags.compress) {

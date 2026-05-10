@@ -1,0 +1,14 @@
+// Copy this file to WiFiCreds.h and fill in your credentials.
+// WiFiCreds.h is gitignored so the secrets don't end up in the repo.
+//
+//   cp include/WiFiCreds.h.example include/WiFiCreds.h
+//   $EDITOR include/WiFiCreds.h
+//   pio run -e htm00_wifi -t upload --upload-port /dev/ttyACM0
+#pragma once
+
+#define WIFI_SSID      "YourSSID"
+#define WIFI_PASS      "YourPassword"
+#define WIFI_HOSTNAME  "helionet-htm00"
+
+// UDP port the firmware listens on for the wire-protocol bridge.
+#define BRIDGE_UDP_PORT  7000

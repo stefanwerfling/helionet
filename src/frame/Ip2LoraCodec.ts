@@ -1,12 +1,14 @@
 import { crc16Xmodem } from './Crc16Xmodem.js';
 
 export const FLAG_COMPRESS = 0x80;
-export const FLAG_CIPHER = 0x40;
-export const ADDR_MASK = 0x0f;
+export const FLAG_CIPHER   = 0x40;   // XOR (legacy, kept for upstream compat)
+export const FLAG_AEAD     = 0x20;   // ChaCha20-Poly1305, wirePayload = nonce||ct||tag
+export const ADDR_MASK     = 0x0f;
 
 export interface FrameFlags {
     compress: boolean;
     cipher: boolean;
+    aead: boolean;
 }
 
 export interface EncodeInput {
@@ -44,12 +46,9 @@ export function encodeFrame(input: EncodeInput): Uint8Array {
     }
 
     let addrFlags = input.addr & ADDR_MASK;
-    if (input.flags.compress) {
-        addrFlags |= FLAG_COMPRESS;
-    }
-    if (input.flags.cipher) {
-        addrFlags |= FLAG_CIPHER;
-    }
+    if (input.flags.compress) addrFlags |= FLAG_COMPRESS;
+    if (input.flags.cipher)   addrFlags |= FLAG_CIPHER;
+    if (input.flags.aead)     addrFlags |= FLAG_AEAD;
 
     const crcInput = new Uint8Array(1 + input.clearPayload.length);
     crcInput[0] = addrFlags;
@@ -96,7 +95,8 @@ export function decodeFrame(input: Uint8Array): DecodeResult {
         addr: addrFlagsByte & ADDR_MASK,
         flags: {
             compress: (addrFlagsByte & FLAG_COMPRESS) !== 0,
-            cipher: (addrFlagsByte & FLAG_CIPHER) !== 0,
+            cipher:   (addrFlagsByte & FLAG_CIPHER) !== 0,
+            aead:     (addrFlagsByte & FLAG_AEAD) !== 0,
         },
         wirePayload: new Uint8Array(wirePayload),
         claimedCrc,

@@ -15,6 +15,9 @@ interface CliConfig {
     rxConfig: RadioRxConfig;
     cipherKey?: string;
     cipherKeyHex?: string;
+    /** 32-byte ChaCha20-Poly1305 key as hex (64 chars). Strongly recommended
+     *  over cipherKey/cipherKeyHex which is plain XOR. */
+    aeadKeyHex?: string;
     useZlib?: boolean;
     useRohc?: boolean;
 }
@@ -119,6 +122,15 @@ async function main(): Promise<void> {
     device.setMaxFrameSize(cfg.maxLoraFrameSize);
     device.on('error', (e) => process.stderr.write(`device error: ${e.message}\n`));
 
+    let aeadKey: Uint8Array | undefined;
+    if (cfg.aeadKeyHex) {
+        const b = Buffer.from(cfg.aeadKeyHex, 'hex');
+        if (b.length !== 32) {
+            throw new Error(`aeadKeyHex must decode to 32 bytes, got ${b.length}`);
+        }
+        aeadKey = new Uint8Array(b);
+    }
+
     const tunnel = new Ip2LoraTunnel({
         device,
         ipv4: cfg.ipv4,
@@ -127,6 +139,7 @@ async function main(): Promise<void> {
         txConfig: cfg.txConfig,
         rxConfig: cfg.rxConfig,
         cipherKey: resolveCipherKey(cfg),
+        aeadKey,
         useZlib: cfg.useZlib,
         useRohc: cfg.useRohc,
     });
