@@ -14,8 +14,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <RadioLib.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h>
+#include <U8g2lib.h>
 #include "Pins.h"
 
 constexpr uint8_t  CMD_SEND    = 0x01;
@@ -46,11 +45,11 @@ volatile bool packetReady = false;
 ICACHE_RAM_ATTR void onDio0(void) { packetReady = true; }
 #endif
 
-// SH1106 driver: the controller has 132x64 display RAM but routes columns
-// 2..129 to the panel, so we use 128x64 with the library's standard offset.
-// Use the SH1107 driver in 128x128 mode so we can probe a tall area at once
-// — many tiny Heltec OLEDs are actually SH1107 with addressable height >64.
-Adafruit_SH1107 oled(128, 128, &Wire, OLED_RST);
+// HT-M00 OLED: SH1107 64×128 (tall narrow panel). Driver identified by the
+// oled_probe firmware; vendor doesn't document it. Empirically R0 reads the
+// right way up — earlier memory note that the panel was rotated 180° was
+// based on Adafruit_SH110X output and turned out not to apply here.
+U8G2_SH1107_64X128_F_HW_I2C oled(U8G2_R0, OLED_RST);
 
 enum class ParseState : uint8_t { IDLE, NEED_LEN, NEED_BODY };
 static ParseState pState = ParseState::IDLE;
@@ -73,8 +72,22 @@ struct LoraSettings {
 
 static LoraSettings tx;
 static LoraSettings rx;
-static char    displayText[DISPLAY_BUF_SIZE] = "init...";
+static char    displayText[DISPLAY_BUF_SIZE] = "";
 static bool    oledOk = false;
+
+// Live counters for the on-screen status panel.
+static uint32_t txCount = 0;
+static uint32_t rxCount = 0;
+static float    lastRssi = 0.0f;
+static float    lastSnr = 0.0f;
+static bool     hasLastRx = false;
+static unsigned long lastRedrawMs = 0;
+
+#ifdef USE_DUPLEX
+static constexpr const char* kModeName = "DUPLEX";
+#else
+static constexpr const char* kModeName = LORA_CH_NAME;
+#endif
 
 static float bandwidthCodeToKHz(uint8_t c) {
     return c == 1 ? 250.0f : c == 2 ? 500.0f : 125.0f;
@@ -122,33 +135,55 @@ static void replyConfigOk(void) {
 }
 
 // ---------- OLED ----------
-static int i2cScanFirstResponder(void) {
-    for (uint8_t a = 1; a < 0x7F; a++) {
-        Wire.beginTransmission(a);
-        if (Wire.endTransmission() == 0) return a;
-    }
-    return -1;
-}
+// Panel is 64 px wide × 128 px tall. With 6×10 font we get ~10 chars wide
+// and ~12 lines tall.
+constexpr int OLED_W = 64;
+constexpr int OLED_LINE_H = 10;
 
 static void redrawOled(void) {
     if (!oledOk) return;
-    oled.clearDisplay();
-    oled.setTextSize(1);
-    oled.setTextColor(SH110X_WHITE);
-    oled.setCursor(0, 0);
-    oled.println(F("helionet"));
-    int x = 0, y = 10;
-    oled.setCursor(x, y);
-    for (size_t i = 0; displayText[i] && y < OLED_HEIGHT; i++) {
-        char c = displayText[i];
-        if (c == '\n') {
-            x = 0; y += 10;
-            oled.setCursor(x, y);
-        } else {
-            oled.write(c);
-        }
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_6x10_tf);
+
+    int y = OLED_LINE_H;
+    oled.setCursor(0, y); oled.print("helionet");
+    y += OLED_LINE_H;
+    oled.setCursor(0, y); oled.printf("%s", kModeName);
+    y += OLED_LINE_H;
+    oled.setCursor(0, y); oled.printf("%.1fMHz", tx.freqMHz);
+    y += OLED_LINE_H;
+    oled.setCursor(0, y); oled.printf("TX %lu", (unsigned long)txCount);
+    y += OLED_LINE_H;
+    oled.setCursor(0, y); oled.printf("RX %lu", (unsigned long)rxCount);
+    y += OLED_LINE_H;
+    if (hasLastRx) {
+        oled.setCursor(0, y); oled.printf("R %ddBm", (int)lastRssi);
+        y += OLED_LINE_H;
+        oled.setCursor(0, y); oled.printf("S %.1fdB", lastSnr);
+        y += OLED_LINE_H;
+    } else {
+        oled.setCursor(0, y); oled.print("R --");
+        y += OLED_LINE_H;
+        oled.setCursor(0, y); oled.print("S --");
+        y += OLED_LINE_H;
     }
-    oled.display();
+
+    // Separator + free-form host text (CMD_DISPLAY).
+    oled.drawHLine(0, y - OLED_LINE_H + 2, OLED_W);
+    int x = 0;
+    for (size_t i = 0; displayText[i] && y < 128; i++) {
+        char c = displayText[i];
+        if (c == '\n' || x >= OLED_W - 6) {
+            x = 0; y += OLED_LINE_H;
+            oled.setCursor(x, y);
+            if (c == '\n') continue;
+        }
+        if (x == 0) oled.setCursor(0, y);
+        oled.write(c);
+        x += 6;
+    }
+    oled.sendBuffer();
+    lastRedrawMs = millis();
 }
 
 static void setDisplayText(const uint8_t* body, uint16_t len) {
@@ -160,22 +195,28 @@ static void setDisplayText(const uint8_t* body, uint16_t len) {
 
 static void initOled(void) {
     pinMode(VEXT_PIN, OUTPUT);
-    digitalWrite(VEXT_PIN, LOW);
+    digitalWrite(VEXT_PIN, LOW);   // active-low: peripheral rail ON
     delay(50);
     pinMode(OLED_RST, OUTPUT);
-    digitalWrite(OLED_RST, LOW);
-    delay(20);
-    digitalWrite(OLED_RST, HIGH);
-    delay(20);
+    digitalWrite(OLED_RST, LOW);  delay(20);
+    digitalWrite(OLED_RST, HIGH); delay(20);
+
     Wire.begin(OLED_SDA, OLED_SCL);
     Wire.setClock(400000);
-    int a = i2cScanFirstResponder();
-    Serial.printf("i2c scan: 0x%02X\n", a);
-    if (a < 0) return;
-    uint8_t addr = (a == 0x3D) ? 0x3D : 0x3C;
-    bool ok = oled.begin(addr, true);
-    Serial.printf("sh110x.begin(0x%02X) -> %s\n", addr, ok ? "true" : "false");
+
+    oled.setI2CAddress(0x3C * 2);   // U8g2 wants the 8-bit form
+    bool ok = oled.begin();
+    Serial.printf("oled.begin -> %s\n", ok ? "true" : "false");
     if (!ok) return;
+    // Brightness path on the SH1107: the contrast register only modulates
+    // gate drive — the actual emitter current comes from the internal DC/DC
+    // charge pump (commands 0xAD 0x8A..0x8D for 7.4V..9.0V). U8g2's begin()
+    // doesn't always switch it on, so we send it explicitly.
+    // setContrast(255) is the only knob that survives empirically — the
+    // SH1107 charge-pump (0xAD), precharge (0xD9) and VCOMH (0xDB) tweaks
+    // had no visible effect on this panel, brightness is hardware-limited.
+    oled.setContrast(255);
+    oled.setContrast(255);
     oledOk = true;
     redrawOled();
 }
@@ -232,6 +273,7 @@ static void handleSendBody(const uint8_t* body, uint16_t len) {
     bool sameFreq = fabsf(tx.freqMHz - rx.freqMHz) < 0.01f;
     if (sameFreq) rxRadio.standby();
     int16_t st = txRadio.transmit(const_cast<uint8_t*>(body), len);
+    if (st == RADIOLIB_ERR_NONE) txCount++;
     Serial.printf("#tx n=%u st=%d sameFreq=%d\n", (unsigned)len, st, (int)sameFreq);
     if (sameFreq) {
         int16_t sr = rxRadio.startReceive();
@@ -240,6 +282,7 @@ static void handleSendBody(const uint8_t* body, uint16_t len) {
 #else
     if (fabsf(tx.freqMHz - rx.freqMHz) > 0.001f) txRadio.setFrequency(tx.freqMHz);
     int16_t st = txRadio.transmit(const_cast<uint8_t*>(body), len);
+    if (st == RADIOLIB_ERR_NONE) txCount++;
     Serial.printf("#tx n=%u st=%d\n", (unsigned)len, st);
     if (fabsf(tx.freqMHz - rx.freqMHz) > 0.001f) txRadio.setFrequency(rx.freqMHz);
     int16_t sr = txRadio.startReceive();
@@ -291,9 +334,15 @@ static void emitReceivedFrame(SX1276& r) {
     }
     uint8_t buf[MAX_PAYLOAD];
     int16_t st = r.readData(buf, len);
+    float rssi = r.getRSSI();
+    float snr  = r.getSNR();
     Serial.printf("#rxev n=%u st=%d rssi=%.1f snr=%.1f\n",
-                  (unsigned)len, st, r.getRSSI(), r.getSNR());
+                  (unsigned)len, st, rssi, snr);
     if (st == RADIOLIB_ERR_NONE) {
+        rxCount++;
+        lastRssi = rssi;
+        lastSnr  = snr;
+        hasLastRx = true;
         Serial.write(buf, len);
         Serial.flush();
     }
@@ -365,4 +414,9 @@ void loop(void) {
     if (packetReady) { packetReady = false; emitReceivedFrame(radio); }
 #endif
     heartbeatTick();
+
+    // Refresh the on-screen counters/RSSI ~twice a second.
+    if (oledOk && (millis() - lastRedrawMs) >= 500) {
+        redrawOled();
+    }
 }
