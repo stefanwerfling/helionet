@@ -211,10 +211,16 @@ static void handleConfigBody(const uint8_t* body, uint16_t len) {
 static void handleSendBody(const uint8_t* body, uint16_t len) {
     if (len == 0 || len > MAX_PAYLOAD) return;
 #ifdef USE_DUPLEX
-    // Each chip stays on its own frequency; no swapping needed.
+    // Park rxRadio so it doesn't pick up our own transmission via PCB
+    // coupling and emit a spurious #rxev. CH0/CH1 share the antenna ground
+    // path and on the same board the TX leaks at ~-43 dBm, easily strong
+    // enough to trip CH1's RX-Done. Standby disables the demodulator;
+    // re-arm when we're done.
+    rxRadio.standby();
     int16_t st = txRadio.transmit(const_cast<uint8_t*>(body), len);
     Serial.printf("#tx n=%u st=%d\n", (unsigned)len, st);
-    // rxRadio is already in receive on its own frequency — leave it alone.
+    int16_t sr = rxRadio.startReceive();
+    if (sr != RADIOLIB_ERR_NONE) Serial.printf("#rxon st=%d\n", sr);
 #else
     if (fabsf(tx.freqMHz - rx.freqMHz) > 0.001f) txRadio.setFrequency(tx.freqMHz);
     int16_t st = txRadio.transmit(const_cast<uint8_t*>(body), len);
