@@ -121,8 +121,10 @@ export class Ip2LoraTunnel extends EventEmitter {
     }
 
     private onTunPacket(chunk: Buffer): void {
+        this.emit('tun-rx', chunk.length);
         const ip = stripTunPiHeader(new Uint8Array(chunk));
         if (!ip || (ip[0] >> 4) !== 4) {
+            this.emit('drop', { where: 'tun-not-ipv4', len: chunk.length });
             return;
         }
         const destLastOctet = ip[19];
@@ -165,11 +167,13 @@ export class Ip2LoraTunnel extends EventEmitter {
         const max = this.opts.maxLoraFrameSize;
         for (let off = 0; off < frame.length; off += max) {
             const segment = frame.subarray(off, Math.min(off + max, frame.length));
+            this.emit('wire-tx', { len: segment.length, addr });
             this.opts.device.sendRadioFrame(segment).catch((e) => this.emit('error', e));
         }
     }
 
     private onSerialBytes(chunk: Uint8Array): void {
+        this.emit('serial-rx', chunk.length);
         const merged = new Uint8Array(this.rxBuffer.length + chunk.length);
         merged.set(this.rxBuffer, 0);
         merged.set(chunk, this.rxBuffer.length);
@@ -187,21 +191,25 @@ export class Ip2LoraTunnel extends EventEmitter {
             }
 
             if (res.addr !== this.localAddr) {
+                this.emit('drop', { where: 'addr-mismatch', got: res.addr, want: this.localAddr });
                 i += res.bytesConsumed;
                 continue;
             }
 
             const clear = this.recoverClearPayload(res.wirePayload, res.flags);
             if (!clear) {
+                this.emit('drop', { where: 'recover-failed' });
                 i += 1;
                 continue;
             }
 
             if (!verifyCrc(res.addrFlagsByte, clear, res.claimedCrc)) {
+                this.emit('drop', { where: 'crc-mismatch', addr: res.addr });
                 i += 1;
                 continue;
             }
 
+            this.emit('wire-rx', { len: clear.length, addr: res.addr });
             this.deliverToTun(clear);
             i += res.bytesConsumed;
         }

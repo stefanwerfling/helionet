@@ -20,6 +20,69 @@ const CONFIG_MAX_TRIES = 10;
 
 type Mode = 'closed' | 'normal' | 'configuring';
 
+// Splits the firmware byte stream into log lines and radio frame bodies.
+// FW protocol convention used by helionet's HT-M00 firmware:
+//   - lines starting with '#' and ending with '\n' are diagnostic logs
+//     (#begin, #apply, #tx, #rxev, ...).
+//   - "#rxev n=N st=0 ..." announces that the next N bytes are a radio
+//     frame the chip just received.
+//   - Anything else (boot banners, garbage on USB-CDC reset) is dropped.
+type SplitterMode = 'scan' | 'in-log' | 'frame-body';
+class FrameLogSplitter {
+    private mode: SplitterMode = 'scan';
+    private logLine = '';
+    private frameRemaining = 0;
+    private frameBuf = Buffer.alloc(0);
+    public onLog?: (line: string) => void;
+    public onFrame?: (frame: Buffer) => void;
+
+    public reset(): void {
+        this.mode = 'scan';
+        this.logLine = '';
+        this.frameRemaining = 0;
+        this.frameBuf = Buffer.alloc(0);
+    }
+
+    public feed(chunk: Buffer): void {
+        for (let i = 0; i < chunk.length; i++) {
+            const b = chunk[i];
+            if (this.mode === 'frame-body') {
+                this.frameBuf = Buffer.concat([this.frameBuf, Buffer.from([b])]);
+                this.frameRemaining--;
+                if (this.frameRemaining === 0) {
+                    const f = this.frameBuf;
+                    this.frameBuf = Buffer.alloc(0);
+                    this.mode = 'scan';
+                    this.onFrame?.(f);
+                }
+            } else if (this.mode === 'in-log') {
+                if (b === 0x0a) {
+                    const line = this.logLine;
+                    this.logLine = '';
+                    this.onLog?.(line);
+                    const m = line.match(/^#rxev n=(\d+) st=0/);
+                    if (m) {
+                        const n = parseInt(m[1], 10);
+                        if (n > 0 && n <= 255) {
+                            this.frameRemaining = n;
+                            this.mode = 'frame-body';
+                            continue;
+                        }
+                    }
+                    this.mode = 'scan';
+                } else {
+                    this.logLine += String.fromCharCode(b);
+                }
+            } else if (b === 0x23) {
+                this.mode = 'in-log';
+                this.logLine = '#';
+            }
+            // Everything else in 'scan' mode is dropped silently (boot banner,
+            // ROM bootloader noise on the wrong baud at reset, etc.).
+        }
+    }
+}
+
 interface ConfigWaiter {
     resolve: () => void;
     reject: (e: Error) => void;
@@ -41,10 +104,16 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
     private lastTxConfig?: RadioTxConfig;
     private maxFrameSizeBytes = 255;
     private keepaliveTimer?: NodeJS.Timeout;
+    private splitter = new FrameLogSplitter();
 
     public constructor(opts: HtM00DeviceOptions) {
         super();
         this.opts = opts;
+        this.splitter.onLog = (line) => this.emit('log', line);
+        this.splitter.onFrame = (frame) => this.emit(
+            'data',
+            new Uint8Array(frame.buffer, frame.byteOffset, frame.byteLength),
+        );
     }
 
     public open(): Promise<void> {
@@ -272,16 +341,22 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
             this.configBuffer = Buffer.concat([this.configBuffer, chunk]);
             const idx = this.configBuffer.indexOf(CONFIG_OK);
             if (idx >= 0) {
+                // Bytes before CONFIG_OK are firmware diagnostics from the
+                // config handler (#apply ...). Send them through the splitter
+                // so they show up as 'log' events. After CONFIG_OK we hand
+                // the rest of the buffer (post-CONFIG_OK) back to the
+                // splitter as well.
                 const before = this.configBuffer.subarray(0, idx);
-                if (before.length) {
-                    this.emit('data', new Uint8Array(before.buffer, before.byteOffset, before.byteLength));
-                }
+                const after = this.configBuffer.subarray(idx + CONFIG_OK.length);
+                this.configBuffer = Buffer.alloc(0);
+                if (before.length) this.splitter.feed(before);
                 clearTimeout(this.configWaiter!.timer);
                 this.configWaiter!.resolve();
+                if (after.length) this.splitter.feed(after);
             }
             return;
         }
-        this.emit('data', new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+        this.splitter.feed(chunk);
     }
 
     private startKeepalive(opts: { intervalMs: number; payload: Uint8Array }): void {

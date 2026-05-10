@@ -35,7 +35,8 @@ const tunnel = new Ip2LoraTunnel({
         datarate: 7,
         coderate: 1,
         preambleLen: 8,
-        timeout: 3000,
+        crcOn: 1,                  // SX1276 hardware CRC: corrupt frames are
+        timeout: 3000,             // dropped by the chip itself, never seen.
     },
     rxConfig: {
         channel: freqHz,
@@ -44,6 +45,7 @@ const tunnel = new Ip2LoraTunnel({
         datarate: 7,
         coderate: 1,
         preambleLen: 8,
+        crcOn: 1,
         rxContinuous: 1,
     },
 });
@@ -53,6 +55,11 @@ tunnel.on('started', (info) => {
 });
 tunnel.on('warn', (msg) => console.warn(`[tunnel] warn: ${msg}`));
 tunnel.on('error', (e) => console.error(`[tunnel] error: ${e.message}`));
+tunnel.on('tun-rx',    (n) => console.log(`[tunnel] tun-rx ${n}B (-> wire)`));
+tunnel.on('wire-tx',   (m) => console.log(`[tunnel] wire-tx len=${m.len} addr=${m.addr}`));
+tunnel.on('serial-rx', (n) => console.log(`[tunnel] serial-rx ${n}B from board`));
+tunnel.on('wire-rx',   (m) => console.log(`[tunnel] wire-rx  len=${m.len} addr=${m.addr} -> tun`));
+tunnel.on('drop',      (m) => console.log(`[tunnel] drop ${JSON.stringify(m)}`));
 
 await tunnel.start();
 
