@@ -1,0 +1,53 @@
+{
+  "name": "helionet",
+  "version": "0.1.0",
+  "description": "IP tunnelling over LoRa P2P, TypeScript port of airbus-cyber/IP2LoRa, targeting the Heltec HT-M00.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "bin": {
+    "helionet": "dist/cli/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "dev": "tsx src/cli/cli.ts",
+    "start": "node dist/cli/cli.js",
+    "loopback": "tsx examples/loopback.ts"
+  },
+  "keywords": [
+    "lora",
+    "ip2lora",
+    "tunnel",
+    "tuntap",
+    "sx1276",
+    "heltec",
+    "ht-m00"
+  ],
+  "author": "Stefan Werfling",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "node-rohc": "^1.0.5",
+    "serialport": "^13.0.0",
+    "tuntap2": "^0.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

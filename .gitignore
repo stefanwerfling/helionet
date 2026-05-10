@@ -1,0 +1,29 @@
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.env
+.env.local
+
+# IDE
+.idea/
+
+# Firmware build artifacts
+firmware/htm00/.pio/
+firmware/htm00/.venv/
+firmware/htm00/backups/*.bin
+firmware/htm00/backups/*.sha256
+
+# Heltec stock-firmware reverse-engineering workspace.
+# Keep the analysis tooling under _tools/ in the repo, but everything else
+# (downloaded vendor binaries, extracted segments, Ghidra project DB,
+# disassembly listings, decompile outputs) is regenerated locally.
+firmware/org_files/M00_*/
+firmware/org_files/complete_firmware/
+firmware/org_files/_ghidra_proj/
+firmware/org_files/**/*.bin
+firmware/org_files/**/*.S
+firmware/org_files/**/*.elf
+firmware/org_files/**/decompile_*.c
+firmware/org_files/**/strings_*.txt
+firmware/org_files/**/image_info.txt

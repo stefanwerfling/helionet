@@ -1,0 +1,46 @@
+{
+  "device": {
+    "port": "/dev/ttyACM0",
+    "baudRate": 115200,
+    "rtscts": true
+  },
+  "ipv4": "172.16.10.1/28",
+  "mtu": 128,
+  "maxLoraFrameSize": 255,
+  "txConfig": {
+    "channel": 868000000,
+    "modem": 1,
+    "power": 14,
+    "fdev": 0,
+    "bandwidth": 0,
+    "datarate": 7,
+    "coderate": 1,
+    "preambleLen": 8,
+    "fixLen": 0,
+    "crcOn": 0,
+    "freqHopOn": 0,
+    "hopPeriod": 0,
+    "iqInverted": 0,
+    "timeout": 3000
+  },
+  "rxConfig": {
+    "channel": 868300000,
+    "modem": 1,
+    "bandwidth": 0,
+    "datarate": 7,
+    "coderate": 1,
+    "bandwidthAfc": 0,
+    "preambleLen": 8,
+    "symbTimeout": 5,
+    "fixLen": 0,
+    "payloadLen": 0,
+    "crcOn": 0,
+    "freHopOn": 0,
+    "hopPeriod": 0,
+    "iqInverted": 0,
+    "rxContinuous": 1
+  },
+  "cipherKeyHex": "0102030405060708090a0b0c0d0e0f",
+  "useZlib": true,
+  "useRohc": false
+}
