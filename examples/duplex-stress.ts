@@ -128,17 +128,33 @@ await Promise.all([
     a.configureTx({ ...baseCfg, channel: freqA, power: 14, timeout: 3000 }),
     b.configureTx({ ...baseCfg, channel: freqB, power: 14, timeout: 3000 }),
 ]);
-console.log('configs done, blasting frames...');
+console.log('configs done; settling 1.5s before blast...');
+// Both radios just had their config rewritten (frequency, SF, etc.).
+// Give the chips and the firmware loop time to drain any pending state
+// before we start a parallel burst — the first few frames are otherwise
+// lost to half-finished initialisation paths on both sides.
+await new Promise((r) => setTimeout(r, 1500));
 
+// Discard whatever leaked into the collectors during settling.
+collA.received.length = 0;
+collB.received.length = 0;
+
+console.log('blasting frames...');
 const t0 = Date.now();
 
-async function blast(dev: HtM00Device, label: string): Promise<void> {
+async function blast(dev: HtM00Device, label: string, initialDelayMs: number): Promise<void> {
+    await new Promise((r) => setTimeout(r, initialDelayMs));
     for (let i = 1; i <= N; i++) {
         await dev.sendRadioFrame(makeFrame(label, i));
     }
 }
 
-await Promise.all([blast(a, 'A'), blast(b, 'B')]);
+// De-phase the two senders. Without this both blast() loops start at the
+// same instant on identical configs, so frames 1..N collide cycle-for-cycle.
+// A 0..400ms head-start gap on one side makes their TX windows interleave.
+const phaseGap = Math.floor(Math.random() * 400);
+console.log(`A starts at +0ms, B starts at +${phaseGap}ms`);
+await Promise.all([blast(a, 'A', 0), blast(b, 'B', phaseGap)]);
 const sentMs = Date.now() - t0;
 console.log(`both senders done in ${sentMs}ms; waiting 4s for in-flight RX...`);
 

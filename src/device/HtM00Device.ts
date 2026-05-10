@@ -205,7 +205,11 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
             preambleLen: this.lastTxConfig.preambleLen,
             implicitHeader: this.lastTxConfig.fixLen === 1,
         });
-        await delay(maxAirtimeMs + airtimeMs * Math.random());
+        // Random ALOHA backoff. The jitter range needs to be at least one
+        // full airtime so two senders running identical loops on identical
+        // configs don't stay phase-locked — a small jitter (0..1×airtime)
+        // wasn't enough and pairs of boards kept colliding cycle after cycle.
+        await delay(maxAirtimeMs + 2 * airtimeMs * Math.random());
     }
 
     private write(buf: Buffer): Promise<void> {
