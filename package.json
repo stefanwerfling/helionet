@@ -22,9 +22,11 @@
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf dist",
-    "dev": "tsx src/cli/cli.ts",
     "start": "node dist/cli/cli.js",
-    "loopback": "tsx examples/loopback.ts"
+    "tunnel-daemon": "node examples/tunnel-daemon.mjs",
+    "test:roundtrip": "npx tsx examples/radio-roundtrip.ts",
+    "test:uni-stress": "npx tsx examples/uni-stress.ts",
+    "test:duplex-stress": "npx tsx examples/duplex-stress.ts"
   },
   "keywords": [
     "lora",

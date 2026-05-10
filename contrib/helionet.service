@@ -1,0 +1,41 @@
+# systemd unit template for helionet.
+#
+# Install:
+#   sudo cp contrib/helionet.service /etc/systemd/system/
+#   sudo cp examples/config.example.json /etc/helionet/config.json
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now helionet
+#
+# Adjust ExecStart / WorkingDirectory if you installed via `npm install -g`
+# (then ExecStart becomes `/usr/bin/env helionet --config ...`) instead of
+# running out of a checkout.
+
+[Unit]
+Description=helionet IP-over-LoRa tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/helionet
+ExecStart=/usr/bin/node /opt/helionet/dist/cli/cli.js --config /etc/helionet/config.json
+Restart=on-failure
+RestartSec=5
+
+# Needs CAP_NET_ADMIN to create the TUN interface, plus access to the
+# serial device.  AmbientCapabilities lets us drop root if desired.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+DeviceAllow=/dev/ttyACM0 rw
+DeviceAllow=/dev/net/tun rw
+
+# Hardening (relax if your setup needs more access).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+ReadWritePaths=/var/log/helionet
+
+[Install]
+WantedBy=multi-user.target

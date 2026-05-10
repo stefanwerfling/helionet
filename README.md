@@ -84,11 +84,26 @@ Root privileges are needed to create the TUN interface.
 
 ```bash
 sudo node dist/cli/cli.js --config /etc/helionet/config.json
+sudo node dist/cli/cli.js --config /etc/helionet/config.json --verbose   # log every packet
+sudo node dist/cli/cli.js --version
+sudo node dist/cli/cli.js --help
 ```
 
 See [`examples/config.example.json`](examples/config.example.json) for the schema.
-The `cipherKeyHex` field is the raw key in hex; `cipherKey` is the same as a
-UTF-8 string.
+The optional `cipherKeyHex` field is the raw key in hex; `cipherKey` is the same
+as a UTF-8 string. Leave both out for an unencrypted tunnel.
+
+For systemd:
+
+```bash
+sudo cp contrib/helionet.service /etc/systemd/system/
+sudo cp examples/config.example.json /etc/helionet/config.json
+sudo systemctl daemon-reload
+sudo systemctl enable --now helionet
+```
+
+The unit needs `CAP_NET_ADMIN` (TUN) and access to the serial device — both
+already declared in the template.
 
 ## Architecture
 
@@ -111,16 +126,35 @@ See [`firmware/htm00/`](firmware/htm00/). The firmware speaks the same binary
 protocol over USB-CDC as the original IP2LoRa B-L072Z-LRWAN1 firmware, so this
 host implementation works against any board that implements that protocol.
 
-Pin mapping for HT-M00 (CH0 only — CH1 is left untouched):
+The HT-M00 carries two SX1276 sharing one SPI bus. Three build modes:
+
+| Env | Build flag | Mode |
+|-----|-----------|------|
+| `htm00` | (default) | CH0 only, half-duplex |
+| `htm00_ch1` | `-DUSE_CH1` | CH1 only — diagnostic |
+| `htm00_duplex` | `-DUSE_DUPLEX` | CH0 transmits + CH1 receives concurrently |
+| `htm00_rfo`, `htm00_ch1_rfo` | `-DUSE_RFO` | swap PA_BOOST → RFO (defective PA-trace recovery) |
+| `htm00_oledprobe` | — | display-driver probe (separate `main()`) |
+
+Pin mapping (extracted from Heltec's V2.0 stock firmware via Ghidra; see
+`firmware/org_files/_tools/`):
+
+| Function | CH0 | CH1 |
+|----------|-----|-----|
+| NSS      | 18  | 23  |
+| RST      | 14  | 13  |
+| DIO0     | 26  | 25  |
+| DIO1     | 35  | 34  |
+| SCK / MOSI / MISO | 5 / 27 / 19 (shared) | shared |
+
+Other peripherals on the board:
 
 | Function | GPIO |
 |----------|------|
-| NSS      | 18   |
-| SCK      | 5    |
-| MOSI     | 27   |
-| MISO     | 19   |
-| RST      | 14   |
-| DIO0     | 26   |
+| OLED SDA / SCL | 4 / 15 (SH1107 @ 0x3C, 64×128) |
+| OLED RST | 16 |
+| Vext (peripheral rail enable) | 21 (active-low) |
+| Heartbeat LED | 17 |
 
 ## License
 
