@@ -1,6 +1,12 @@
 import { EventEmitter } from 'node:events';
 import { Buffer } from 'node:buffer';
-import * as tuntap2 from 'tuntap2';
+import { createRequire } from 'node:module';
+// tsx's ESM<->CJS bridge can't import the native N-API tuntap2 module via
+// `import * as tuntap2 from 'tuntap2'` (the namespace ends up empty).
+// createRequire forces the host's CommonJS loader, which works for both
+// `tsx` and a precompiled `node dist/...` run.
+import type * as tuntap2types from 'tuntap2';
+const tuntap2 = createRequire(import.meta.url)('tuntap2') as typeof tuntap2types;
 const { Tun } = tuntap2;
 type Tun = InstanceType<typeof tuntap2.Tun>;
 import {
