@@ -6,7 +6,7 @@
 //                              [host=helionet-htm00]
 //
 // On success the firmware reconnects and prints its new IP via Serial.
-import { HtM00Device } from '../dist/index.js';
+import { HelionetDevice } from '../dist/index.js';
 
 const args = Object.fromEntries(
     process.argv.slice(2).map((a) => {
@@ -24,7 +24,7 @@ if (!ssid || pass === undefined) {
     process.exit(2);
 }
 
-const dev = new HtM00Device({ port, rtscts: false });
+const dev = new HelionetDevice({ port, rtscts: false });
 dev.on('error', (e) => process.stderr.write(`device error: ${e.message}\n`));
 dev.on('log',   (l) => process.stderr.write(`[fw] ${l.replace(/\n$/, '')}\n`));
 

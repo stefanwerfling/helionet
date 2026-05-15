@@ -4,7 +4,7 @@
 // eigenem Prefix) wäre damit sofort sichtbar.
 //
 // Argumente: a=/dev/ttyACM0 b=/dev/ttyACM1 n=20 freq=868000000
-import { HtM00Device } from '../src/index.js';
+import { HelionetDevice } from '../src/index.js';
 import { execFileSync } from 'node:child_process';
 import { Buffer } from 'node:buffer';
 
@@ -94,8 +94,8 @@ class FrameCollector {
     }
 }
 
-const a = new HtM00Device({ port: portA, rtscts: false });
-const b = new HtM00Device({ port: portB, rtscts: false });
+const a = new HelionetDevice({ port: portA, rtscts: false });
+const b = new HelionetDevice({ port: portB, rtscts: false });
 const collA = new FrameCollector('A');
 const collB = new FrameCollector('B');
 a.on('data', (c: Uint8Array) => collA.onData(Buffer.from(c)));
@@ -142,7 +142,7 @@ collB.received.length = 0;
 console.log('blasting frames...');
 const t0 = Date.now();
 
-async function blast(dev: HtM00Device, label: string, initialDelayMs: number): Promise<void> {
+async function blast(dev: HelionetDevice, label: string, initialDelayMs: number): Promise<void> {
     await new Promise((r) => setTimeout(r, initialDelayMs));
     for (let i = 1; i <= N; i++) {
         await dev.sendRadioFrame(makeFrame(label, i));

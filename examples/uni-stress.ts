@@ -1,7 +1,7 @@
 // Unidirektionaler Stress-Test: Sender schickt N Frames sequentiell, Empfänger
 // zählt wie viele ankommen. Nutzt den gleichen Frame-Parser wie duplex-stress.
 // Argumente: tx=/dev/ttyACM0 rx=/dev/ttyACM1 n=20 size=32
-import { HtM00Device } from '../src/index.js';
+import { HelionetDevice } from '../src/index.js';
 import { execFileSync } from 'node:child_process';
 import { Buffer } from 'node:buffer';
 
@@ -62,8 +62,8 @@ function makeFrame(idx: number): Buffer {
     return f;
 }
 
-const tx = new HtM00Device({ port: txPort, rtscts: false });
-const rx = new HtM00Device({ port: rxPort, rtscts: false });
+const tx = new HelionetDevice({ port: txPort, rtscts: false });
+const rx = new HelionetDevice({ port: rxPort, rtscts: false });
 const collRx = new FrameCollector();
 rx.on('data', (c: Uint8Array) => collRx.onData(Buffer.from(c)));
 rx.on('error', (e) => process.stderr.write(`rx err: ${e.message}\n`));

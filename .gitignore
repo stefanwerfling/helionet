@@ -9,14 +9,14 @@ build/
 .idea/
 
 # Firmware build artifacts
-firmware/htm00/.pio/
-firmware/htm00/.venv/
-firmware/htm00/backups/*.bin
-firmware/htm00/backups/*.sha256
+firmware/helionet/.pio/
+firmware/helionet/.venv/
+firmware/helionet/backups/*.bin
+firmware/helionet/backups/*.sha256
 
 # Local WiFi credentials for the WIFI_BRIDGE build, generated from
 # WiFiCreds.h.example. Never commit.
-firmware/htm00/include/WiFiCreds.h
+firmware/helionet/include/WiFiCreds.h
 
 # Heltec stock-firmware reverse-engineering workspace.
 # Keep the analysis tooling under _tools/ in the repo, but everything else

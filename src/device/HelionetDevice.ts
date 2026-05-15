@@ -12,16 +12,37 @@ import {
 const CMD_SEND = 0x01;
 const CMD_CONFIG = 0x02;
 const CMD_DISPLAY = 0x03;
+const CMD_INFO = 0x04;
 const CONFIG_OK = Buffer.from('CONFIG_OK', 'ascii');
+const INFO_MAGIC = Buffer.from('INFO', 'ascii');
 
 const DEFAULT_BAUD = 115200;
 const CONFIG_TIMEOUT_MS = 1500;
 const CONFIG_MAX_TRIES = 10;
+const INFO_TIMEOUT_MS = 1500;
 
-type Mode = 'closed' | 'normal' | 'configuring';
+type Mode = 'closed' | 'normal' | 'configuring' | 'info';
+
+/** Hardware + firmware info reported by the board on CMD_INFO. */
+export interface DeviceInfo {
+    /** Firmware version string, e.g. "0.3". */
+    fw: string;
+    /** Board name, e.g. "htm00" or "heltec_v3". */
+    board: string;
+    /** LoRa chip family, e.g. "SX1276" or "SX1262". */
+    chip: string;
+    /** Active build mode, e.g. "CH0", "CH1", "DUPLEX", "SX1262". */
+    mode: string;
+    /** True if compiled with WiFi-bridge support. */
+    wifi: boolean;
+    /** Maximum LoRa payload bytes the firmware accepts. */
+    maxPayload: number;
+    /** Any extra fields the firmware sends; forwarded as-is. */
+    [extra: string]: unknown;
+}
 
 // Splits the firmware byte stream into log lines and radio frame bodies.
-// FW protocol convention used by helionet's HT-M00 firmware:
+// FW protocol convention:
 //   - lines starting with '#' and ending with '\n' are diagnostic logs
 //     (#begin, #apply, #tx, #rxev, ...).
 //   - "#rxev n=N st=0 ..." announces that the next N bytes are a radio
@@ -89,24 +110,30 @@ interface ConfigWaiter {
     timer: NodeJS.Timeout;
 }
 
-export interface HtM00DeviceOptions extends SerialOptions {
+export interface HelionetDeviceOptions extends SerialOptions {
     /** Send a small periodic dummy frame to keep the radio alive. Default false. */
     keepalive?: { intervalMs: number; payload: Uint8Array };
 }
 
-export class HtM00Device extends EventEmitter implements ILoraDevice {
+export class HelionetDevice extends EventEmitter implements ILoraDevice {
     private port?: SerialPort;
     private mode: Mode = 'closed';
-    private readonly opts: HtM00DeviceOptions;
+    private readonly opts: HelionetDeviceOptions;
     private configBuffer: Buffer = Buffer.alloc(0);
     private configWaiter?: ConfigWaiter;
+    private infoBuffer: Buffer = Buffer.alloc(0);
+    private infoWaiter?: {
+        resolve: (info: DeviceInfo) => void;
+        reject: (e: Error) => void;
+        timer: NodeJS.Timeout;
+    };
     private txLock: Promise<void> = Promise.resolve();
     private lastTxConfig?: RadioTxConfig;
     private maxFrameSizeBytes = 255;
     private keepaliveTimer?: NodeJS.Timeout;
     private splitter = new FrameLogSplitter();
 
-    public constructor(opts: HtM00DeviceOptions) {
+    public constructor(opts: HelionetDeviceOptions) {
         super();
         this.opts = opts;
         this.splitter.onLog = (line) => this.emit('log', line);
@@ -118,7 +145,7 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
 
     public open(): Promise<void> {
         if (this.mode !== 'closed') {
-            return Promise.reject(new Error('HtM00Device already open'));
+            return Promise.reject(new Error('HelionetDevice already open'));
         }
         return new Promise((resolve, reject) => {
             const port = new SerialPort(
@@ -228,7 +255,7 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
 
     public async setDisplayText(text: string): Promise<void> {
         if (this.mode === 'closed') {
-            throw new Error('HtM00Device not open');
+            throw new Error('HelionetDevice not open');
         }
         const body = Buffer.from(text, 'utf-8');
         if (body.length === 0 || body.length > 255) {
@@ -243,9 +270,43 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
         return next;
     }
 
+    /** Ask the firmware to describe its board + chip + build flags. Returns
+     *  whatever the firmware reports as JSON in its `INFO{...}\n` reply. */
+    public async info(): Promise<DeviceInfo> {
+        if (this.mode === 'closed') {
+            throw new Error('HelionetDevice not open');
+        }
+        await this.txLock;
+        return new Promise<DeviceInfo>((resolve, reject) => {
+            this.mode = 'info';
+            this.infoBuffer = Buffer.alloc(0);
+            this.infoWaiter = {
+                resolve: (info) => {
+                    this.mode = 'normal';
+                    this.infoWaiter = undefined;
+                    resolve(info);
+                },
+                reject: (e) => {
+                    this.mode = 'normal';
+                    this.infoWaiter = undefined;
+                    reject(e);
+                },
+                timer: setTimeout(() => {
+                    this.infoWaiter?.reject(new Error('INFO timeout'));
+                }, INFO_TIMEOUT_MS),
+            };
+            const wrapped = Buffer.from([CMD_INFO, 0x00, 0x00]);
+            this.write(wrapped).catch((e) => this.infoWaiter?.reject(e));
+        }).finally(() => {
+            if (this.infoWaiter) {
+                clearTimeout(this.infoWaiter.timer);
+            }
+        });
+    }
+
     public async sendRadioFrame(data: Uint8Array): Promise<void> {
         if (this.mode === 'closed') {
-            throw new Error('HtM00Device not open');
+            throw new Error('HelionetDevice not open');
         }
         const next = this.txLock.then(() => this.doSendFrame(data));
         this.txLock = next.catch(() => undefined);
@@ -295,7 +356,7 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
 
     private async sendConfig(body: Buffer): Promise<void> {
         if (this.mode === 'closed') {
-            throw new Error('HtM00Device not open');
+            throw new Error('HelionetDevice not open');
         }
         const wrapped = Buffer.alloc(3 + body.length);
         wrapped.writeUInt8(CMD_CONFIG, 0);
@@ -360,6 +421,45 @@ export class HtM00Device extends EventEmitter implements ILoraDevice {
                 this.configWaiter!.resolve();
                 if (after.length) this.splitter.feed(after);
             }
+            return;
+        }
+        if (this.mode === 'info') {
+            this.infoBuffer = Buffer.concat([this.infoBuffer, chunk]);
+            const magicIdx = this.infoBuffer.indexOf(INFO_MAGIC);
+            if (magicIdx < 0) {
+                // No magic yet; flush long-buffered noise to the splitter so
+                // logs aren't lost while waiting for the reply.
+                if (this.infoBuffer.length > 4096) {
+                    this.splitter.feed(this.infoBuffer);
+                    this.infoBuffer = Buffer.alloc(0);
+                }
+                return;
+            }
+            const nlIdx = this.infoBuffer.indexOf(0x0a, magicIdx + INFO_MAGIC.length);
+            if (nlIdx < 0) {
+                // JSON tail not yet complete. Forward pre-magic bytes to
+                // the splitter and keep the magic+partial-JSON for next chunk.
+                if (magicIdx > 0) {
+                    this.splitter.feed(this.infoBuffer.subarray(0, magicIdx));
+                    this.infoBuffer = Buffer.from(this.infoBuffer.subarray(magicIdx));
+                }
+                return;
+            }
+            const before = this.infoBuffer.subarray(0, magicIdx);
+            const json = this.infoBuffer.subarray(magicIdx + INFO_MAGIC.length, nlIdx);
+            const after = this.infoBuffer.subarray(nlIdx + 1);
+            this.infoBuffer = Buffer.alloc(0);
+            if (before.length) this.splitter.feed(before);
+            clearTimeout(this.infoWaiter!.timer);
+            try {
+                const info = JSON.parse(json.toString('utf-8')) as DeviceInfo;
+                this.infoWaiter!.resolve(info);
+            } catch (e) {
+                this.infoWaiter!.reject(
+                    new Error(`INFO JSON parse failed: ${(e as Error).message}`),
+                );
+            }
+            if (after.length) this.splitter.feed(after);
             return;
         }
         this.splitter.feed(chunk);

@@ -55,9 +55,10 @@ export {
 } from './device/types.js';
 
 export {
-    HtM00Device,
-    type HtM00DeviceOptions,
-} from './device/HtM00Device.js';
+    HelionetDevice,
+    type HelionetDeviceOptions,
+    type DeviceInfo,
+} from './device/HelionetDevice.js';
 
 export {
     WiFiUdpDevice,

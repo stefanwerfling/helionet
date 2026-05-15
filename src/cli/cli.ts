@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { Buffer } from 'node:buffer';
 import process from 'node:process';
-import { HtM00Device } from '../device/HtM00Device.js';
+import { HelionetDevice } from '../device/HelionetDevice.js';
 import { Ip2LoraTunnel } from '../net/Ip2LoraTunnel.js';
 import type { RadioRxConfig, RadioTxConfig, SerialOptions } from '../device/types.js';
 
@@ -113,7 +113,7 @@ async function main(): Promise<void> {
           }
         : undefined;
 
-    const device = new HtM00Device({
+    const device = new HelionetDevice({
         port: cfg.device.port,
         baudRate: cfg.device.baudRate,
         rtscts: cfg.device.rtscts,

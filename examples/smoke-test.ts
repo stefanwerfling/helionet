@@ -1,6 +1,6 @@
-import { HtM00Device } from '../src/index.js';
+import { HelionetDevice } from '../src/index.js';
 
-const dev = new HtM00Device({
+const dev = new HelionetDevice({
     port: '/dev/ttyACM0',
     baudRate: 115200,
     rtscts: false,

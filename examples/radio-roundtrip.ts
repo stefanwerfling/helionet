@@ -1,6 +1,6 @@
 // Funk-Roundtrip zwischen zwei HT-M00-Boards.
 // Argumente: rxPort=/dev/ttyACM0 txPort=/dev/ttyACM1 (Defaults)
-import { HtM00Device } from '../src/index.js';
+import { HelionetDevice } from '../src/index.js';
 import { execFileSync } from 'node:child_process';
 
 function hwReset(port: string): void {
@@ -24,8 +24,8 @@ const freqHz = Number(args.freq ?? 868_000_000);
 
 console.log(`RX = ${rxPort}, TX = ${txPort}, freq = ${freqHz} Hz`);
 
-const rx = new HtM00Device({ port: rxPort, rtscts: false });
-const tx = new HtM00Device({ port: txPort, rtscts: false });
+const rx = new HelionetDevice({ port: rxPort, rtscts: false });
+const tx = new HelionetDevice({ port: txPort, rtscts: false });
 
 let received: Buffer[] = [];
 let firstRxAt: number | undefined;

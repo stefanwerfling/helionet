@@ -9,7 +9,7 @@
 // Usage (after `npm run build`):
 //   sudo node examples/tunnel-daemon.mjs \
 //     port=/dev/ttyACM0 ipv4=172.16.10.1/30 freq=868000000
-import { HtM00Device, Ip2LoraTunnel } from '../dist/index.js';
+import { HelionetDevice, Ip2LoraTunnel } from '../dist/index.js';
 
 const args = Object.fromEntries(
     process.argv.slice(2).map((a) => a.split('=')),
@@ -20,7 +20,7 @@ const mtu = Number(args.mtu ?? 200);
 const maxLoraFrameSize = Number(args.maxFrame ?? 200);
 const freqHz = Number(args.freq ?? 868_000_000);
 
-const device = new HtM00Device({ port, rtscts: false });
+const device = new HelionetDevice({ port, rtscts: false });
 
 const tunnel = new Ip2LoraTunnel({
     device,

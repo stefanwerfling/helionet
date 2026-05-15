@@ -32,7 +32,7 @@ interface ConfigWaiter {
 type Mode = 'closed' | 'normal' | 'configuring';
 
 /**
- * Drop-in replacement for HtM00Device that talks to the firmware over WiFi/UDP
+ * Drop-in replacement for HelionetDevice that talks to the firmware over WiFi/UDP
  * instead of USB-CDC. The wire protocol is identical (CMD_SEND / CMD_CONFIG /
  * CMD_DISPLAY in, raw radio frame + "CONFIG_OK" out), so Ip2LoraTunnel and the
  * CLI work without changes — only the device constructor differs.
