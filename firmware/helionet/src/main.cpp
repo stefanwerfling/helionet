@@ -978,6 +978,18 @@ static void handleWifiConfig(const uint8_t* body, uint16_t len) {
 static void initBridgeWifi(void) {
     loadWifiConfig();
     loadOrInitSecrets();
+
+    // Register HTTP routes unconditionally — the handler list survives later
+    // http.stop()/http.begin() cycles in handleWifiConfig(), so registering
+    // here means we don't have to re-register on every reconfigure. If WiFi
+    // never comes up, http.begin() is simply skipped.
+    http.on("/", []() {
+        if (!httpRequireAuth()) return;
+        http.send(200, "text/html", renderIndex());
+    });
+    http.on("/stats", httpStats);
+    http.on("/display", HTTP_POST, httpDisplay);
+
     if (!connectWifi()) {
         // Without WiFi the UDP listener is useless, but the parser stays alive
         // over Serial so the host can still push a WC config to us.
@@ -987,12 +999,6 @@ static void initBridgeWifi(void) {
     udpBridge.begin(BRIDGE_UDP_PORT);
     Serial.printf("#udp listening on %d\n", BRIDGE_UDP_PORT);
 
-    http.on("/", []() {
-        if (!httpRequireAuth()) return;
-        http.send(200, "text/html", renderIndex());
-    });
-    http.on("/stats", httpStats);
-    http.on("/display", HTTP_POST, httpDisplay);
     http.begin();
     Serial.println("#http listening on 80");
 }
