@@ -243,6 +243,19 @@ export class HelionetDevice extends EventEmitter implements ILoraDevice {
         await this.sendConfig(buildWifiConfigBody(ssid, pass, hostname));
     }
 
+    /** Provision the 32-byte HMAC key used to authenticate UDP packets between
+     *  host and firmware. Must be called over USB-CDC — the firmware refuses
+     *  this command if it arrives over the (untrusted) UDP path. */
+    public async setUdpAuthKey(key: Buffer): Promise<void> {
+        await this.sendConfig(buildUdpAuthKeyBody(key));
+    }
+
+    /** Set HTTP Basic Auth credentials for the firmware's WebUI. USB-CDC only,
+     *  same as setUdpAuthKey. */
+    public async setHttpAuth(user: string, pass: string): Promise<void> {
+        await this.sendConfig(buildHttpAuthBody(user, pass));
+    }
+
     public async setTxChannel(hz: number): Promise<void> {
         const body = Buffer.alloc(6);
         body.write('Tc', 0, 'ascii');
@@ -481,6 +494,32 @@ export class HelionetDevice extends EventEmitter implements ILoraDevice {
 
 function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+/** Pack an "AK" CMD_CONFIG body: "AK" + 32 raw key bytes. */
+export function buildUdpAuthKeyBody(key: Buffer): Buffer {
+    if (!Buffer.isBuffer(key) || key.length !== 32) {
+        throw new RangeError('UDP auth key must be a 32-byte Buffer');
+    }
+    const body = Buffer.alloc(2 + 32);
+    body.write('AK', 0, 'ascii');
+    key.copy(body, 2);
+    return body;
+}
+
+/** Pack a "HA" CMD_CONFIG body: "HA" + u8 user_len + user + u8 pass_len + pass. */
+export function buildHttpAuthBody(user: string, pass: string): Buffer {
+    const u = Buffer.from(user, 'utf-8');
+    const p = Buffer.from(pass, 'utf-8');
+    if (u.length === 0 || u.length > 64 || p.length === 0 || p.length > 64) {
+        throw new RangeError('http user/pass must each be 1..64 bytes utf-8');
+    }
+    const body = Buffer.alloc(2 + 1 + u.length + 1 + p.length);
+    let off = 0;
+    body.write('HA', off, 'ascii'); off += 2;
+    body.writeUInt8(u.length, off++); u.copy(body, off); off += u.length;
+    body.writeUInt8(p.length, off++); p.copy(body, off);
+    return body;
 }
 
 /** Pack a "WC" CMD_CONFIG body: "WC" + u8 ssid_len + ssid + u8 pass_len + pass

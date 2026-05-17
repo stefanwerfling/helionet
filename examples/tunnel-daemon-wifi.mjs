@@ -2,8 +2,13 @@
 // USB-CDC. Flash the htm00_wifi firmware on the board, point this at the
 // board's WiFi IP, run it as root for TUN.
 //
-//   sudo node examples/tunnel-daemon-wifi.mjs \
+//   sudo HELIONET_UDP_KEY=<64hex> node examples/tunnel-daemon-wifi.mjs \
 //     host=192.168.1.42 ipv4=172.16.10.1/30 freq=868000000
+//
+// The UDP key is the same 32-byte HMAC key that's stored in the firmware's
+// NVS. The firmware prints it on Serial at every boot; you can also push or
+// rotate it via examples/set-wifi.mjs udp-key=...
+import { Buffer } from 'node:buffer';
 import { WiFiUdpDevice, Ip2LoraTunnel } from '../dist/index.js';
 
 const args = Object.fromEntries(
@@ -11,7 +16,8 @@ const args = Object.fromEntries(
 );
 const host = args.host;
 if (!host) {
-    console.error('usage: node tunnel-daemon-wifi.mjs host=<ip> ipv4=<cidr> [freq=<hz>] [port=<udp>]');
+    console.error('usage: node tunnel-daemon-wifi.mjs host=<ip> ipv4=<cidr> [freq=<hz>] [port=<udp>] authKey=<64hex>');
+    console.error('       (authKey can also come from HELIONET_UDP_KEY env var)');
     process.exit(2);
 }
 const port = Number(args.port ?? 7000);
@@ -19,8 +25,14 @@ const ipv4 = args.ipv4 ?? '172.16.10.1/30';
 const mtu = Number(args.mtu ?? 200);
 const maxLoraFrameSize = Number(args.maxFrame ?? 200);
 const freqHz = Number(args.freq ?? 868_000_000);
+const keyHex = args.authKey ?? process.env.HELIONET_UDP_KEY;
+if (!keyHex || !/^[0-9a-fA-F]{64}$/.test(keyHex)) {
+    console.error('error: authKey=<64hex> (or HELIONET_UDP_KEY env var) is required');
+    process.exit(2);
+}
+const authKey = Buffer.from(keyHex, 'hex');
 
-const device = new WiFiUdpDevice({ host, port });
+const device = new WiFiUdpDevice({ host, port, authKey });
 
 const tunnel = new Ip2LoraTunnel({
     device,

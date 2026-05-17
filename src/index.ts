@@ -34,6 +34,17 @@ export {
 } from './frame/AeadCodec.js';
 
 export {
+    UDP_AUTH_KEY_LEN,
+    UDP_AUTH_TAG_LEN,
+    UDP_AUTH_HDR_LEN,
+    UDP_AUTH_OVERHEAD,
+    Seq32ReplayWindow,
+    newSessionId,
+    wrapUdp,
+    unwrapUdp,
+} from './frame/UdpAuth.js';
+
+export {
     zlibCompress,
     zlibDecompress,
 } from './compress/ZlibCodec.js';

@@ -80,12 +80,47 @@ Full details at the top of `src/main.cpp`.
 | Direction | Frame | Meaning |
 |-----------|-------|---------|
 | Host → board | `0x01 [u16 LE len] [payload]` | TX a LoRa frame |
-| Host → board | `0x02 [u16 LE len] ["TC"\|"RC"\|"Tc"\|"WC" struct]` | config |
+| Host → board | `0x02 [u16 LE len] ["TC"\|"RC"\|"Tc" struct]` | LoRa config |
+| Host → board | `0x02 [u16 LE len] ["WC"\|"AK"\|"HA" struct]` | WiFi creds / UDP HMAC key / HTTP auth (USB-CDC only) |
 | Host → board | `0x03 [u16 LE len] [text]` | OLED text |
 | Host → board | `0x04 [u16 LE len] []` | info query (returns `INFO{json}\n`) |
 | Board → host | `"CONFIG_OK"` | after a successful config |
 | Board → host | `"INFO{...}\n"` | after an info query |
 | Board → host | raw bytes | a received LoRa frame |
+
+### WiFi bridge security (`*_wifi` builds)
+
+The UDP transport between host and board is authenticated with HMAC-SHA256
+(16-byte truncated tag), and the WebUI on port 80 is gated by HTTP Basic Auth.
+Both secrets live in NVS and are auto-generated on first boot if not present —
+the firmware logs them on Serial at every boot:
+
+```
+#auth udpkey(hex)=<64 hex chars>
+#auth http user='admin' pass='<16 chars>'
+```
+
+To rotate or set them explicitly over USB (must be USB, not over the WiFi link
+itself):
+
+```bash
+node examples/set-wifi.mjs port=/dev/ttyACM0 udp-key=random
+node examples/set-wifi.mjs port=/dev/ttyACM0 http-user=admin http-pass='hunter2'
+```
+
+The tunnel daemon needs the UDP key to talk to the board:
+
+```bash
+sudo HELIONET_UDP_KEY=<64hex> node examples/tunnel-daemon-wifi.mjs \
+     host=192.168.1.42 ipv4=172.16.10.1/30 freq=868000000
+```
+
+Wire format: each UDP packet is `[u32 LE session][u32 LE seq][payload][u8[16] tag]`
+where `tag = HMAC-SHA256(key, session || seq || payload)[0..16]`. Each side
+randomises its session id at boot; replay protection is a 64-packet sliding
+window per peer session. The `WC`, `AK`, and `HA` config sub-commands are
+refused if they arrive over UDP — they must come over the trusted USB-CDC
+channel.
 
 ## Limitations / TODO
 

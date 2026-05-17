@@ -26,6 +26,9 @@
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <esp_system.h>
+#include <esp_random.h>
+#include <mbedtls/md.h>
 // WiFiCreds.h is optional: compile-time defaults. Runtime CMD_CONFIG "WC"
 // stores credentials in NVS and overrides these.
 #if __has_include("WiFiCreds.h")
@@ -156,6 +159,15 @@ static constexpr bool kHasWifiBridge = false;
 // All of the firmware's "talk to host" calls go through these helpers, so the
 // rest of the code doesn't have to know whether it sits on USB or on WiFi.
 #ifdef USE_WIFI_BRIDGE
+// UDP wire-auth: HMAC-SHA256 truncated to 16 bytes, with a 4-byte session id
+// (random per boot) + 4-byte sequence counter prefixed to every UDP payload
+// in both directions. Replay window is 64 packets per peer session.
+constexpr size_t UDP_AUTH_KEY_LEN  = 32;
+constexpr size_t UDP_AUTH_TAG_LEN  = 16;
+constexpr size_t UDP_AUTH_HDR_LEN  = 8;
+constexpr size_t UDP_AUTH_OVERHEAD = UDP_AUTH_HDR_LEN + UDP_AUTH_TAG_LEN;
+constexpr size_t HTTP_CRED_MAX     = 64;
+
 static WiFiUDP    udpBridge;
 static WebServer  http(80);
 static IPAddress  hostIp;             // last UDP peer that talked to us
@@ -166,18 +178,120 @@ static Preferences wifiPrefs;
 static String     cfgSsid;
 static String     cfgPass;
 static String     cfgHost;
+
+static uint8_t    udpAuthKey[UDP_AUTH_KEY_LEN] = {0};
+static bool       udpAuthSet = false;
+static uint32_t   mySessionId = 0;
+static uint32_t   myOutSeq = 0;
+static uint32_t   peerSessionId = 0;
+static bool       peerSessionSeen = false;
+static uint32_t   peerHighestSeq = 0;
+static uint64_t   peerReplayBitmap = 0;
+
+static String     httpUser;
+static String     httpPass;
+
+// Set by pumpBridge() while feedParser() is processing bytes that arrived
+// over UDP (vs USB-Serial). Used to gate config sub-commands that must only
+// be settable over the trusted USB channel: WC (WiFi creds), AK (UDP auth
+// key), HA (HTTP credentials).
+static bool       g_parserOnUdp = false;
+
 // Forward decl so handleConfigBody can call the bigger reconfigure helper
 // that's defined further down in the WiFi-bridge block.
 static void handleWifiConfig(const uint8_t* body, uint16_t len);
+static void handleAuthKeyConfig(const uint8_t* body, uint16_t len);
+static void handleHttpAuthConfig(const uint8_t* body, uint16_t len);
+
+// HMAC-SHA256 over (session_le || seq_le || payload), truncated to 16 bytes.
+static void udpAuthTag(const uint8_t session[4], uint32_t seq,
+                       const uint8_t* payload, size_t payloadLen,
+                       uint8_t outTag[UDP_AUTH_TAG_LEN]) {
+    uint8_t seqBuf[4] = {
+        (uint8_t)(seq & 0xff),
+        (uint8_t)((seq >> 8) & 0xff),
+        (uint8_t)((seq >> 16) & 0xff),
+        (uint8_t)((seq >> 24) & 0xff),
+    };
+    uint8_t full[32];
+    const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, md, 1);
+    mbedtls_md_hmac_starts(&ctx, udpAuthKey, UDP_AUTH_KEY_LEN);
+    mbedtls_md_hmac_update(&ctx, session, 4);
+    mbedtls_md_hmac_update(&ctx, seqBuf, 4);
+    if (payload && payloadLen) {
+        mbedtls_md_hmac_update(&ctx, payload, payloadLen);
+    }
+    mbedtls_md_hmac_finish(&ctx, full);
+    mbedtls_md_free(&ctx);
+    memcpy(outTag, full, UDP_AUTH_TAG_LEN);
+}
+
+// Constant-time 16-byte comparison.
+static bool udpAuthTagEqual(const uint8_t a[UDP_AUTH_TAG_LEN],
+                            const uint8_t b[UDP_AUTH_TAG_LEN]) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < UDP_AUTH_TAG_LEN; i++) diff |= a[i] ^ b[i];
+    return diff == 0;
+}
+
+// Sliding-window replay check. Reset on a new session id from the peer.
+static bool udpReplayAccept(uint32_t session, uint32_t seq) {
+    if (!peerSessionSeen || session != peerSessionId) {
+        peerSessionId = session;
+        peerSessionSeen = true;
+        peerHighestSeq = seq;
+        peerReplayBitmap = 1;
+        return true;
+    }
+    if (seq > peerHighestSeq) {
+        uint32_t shift = seq - peerHighestSeq;
+        peerReplayBitmap = (shift >= 64) ? 1ull : ((peerReplayBitmap << shift) | 1ull);
+        peerHighestSeq = seq;
+        return true;
+    }
+    uint32_t delta = peerHighestSeq - seq;
+    if (delta >= 64) return false;
+    uint64_t mask = 1ull << delta;
+    if (peerReplayBitmap & mask) return false;
+    peerReplayBitmap |= mask;
+    return true;
+}
 #endif
 
 static void sendToHost(const uint8_t* data, size_t len) {
 #ifdef USE_WIFI_BRIDGE
-    if (wifiOk && hostPort != 0) {
-        udpBridge.beginPacket(hostIp, hostPort);
-        udpBridge.write(data, len);
-        udpBridge.endPacket();
-    }
+    // Mirror to Serial so a USB observer (e.g. set-wifi.mjs over USB-CDC)
+    // also sees CONFIG_OK and incoming radio frames. The UDP host
+    // (tunnel-daemon-wifi) gets the authenticated UDP path; serial readers
+    // get a free duplicate.
+    Serial.write(data, len);
+    Serial.flush();
+    if (!wifiOk || hostPort == 0 || !udpAuthSet) return;
+    uint8_t session[4] = {
+        (uint8_t)(mySessionId & 0xff),
+        (uint8_t)((mySessionId >> 8) & 0xff),
+        (uint8_t)((mySessionId >> 16) & 0xff),
+        (uint8_t)((mySessionId >> 24) & 0xff),
+    };
+    uint32_t seq = myOutSeq++;
+    uint8_t seqBuf[4] = {
+        (uint8_t)(seq & 0xff),
+        (uint8_t)((seq >> 8) & 0xff),
+        (uint8_t)((seq >> 16) & 0xff),
+        (uint8_t)((seq >> 24) & 0xff),
+    };
+    uint8_t tag[UDP_AUTH_TAG_LEN];
+    udpAuthTag(session, seq, data, len, tag);
+
+    udpBridge.beginPacket(hostIp, hostPort);
+    udpBridge.write(session, 4);
+    udpBridge.write(seqBuf, 4);
+    if (len) udpBridge.write(data, len);
+    udpBridge.write(tag, UDP_AUTH_TAG_LEN);
+    udpBridge.endPacket();
 #else
     Serial.write(data, len);
     Serial.flush();
@@ -392,12 +506,9 @@ static void handleInfo(void) {
     Serial.write(reinterpret_cast<const uint8_t*>(json), (size_t)n);
     Serial.flush();
 #ifdef USE_WIFI_BRIDGE
-    // Mirror over UDP so a WiFi-only host also gets the reply.
-    if (wifiOk && hostPort != 0) {
-        udpBridge.beginPacket(hostIp, hostPort);
-        udpBridge.write(reinterpret_cast<const uint8_t*>(json), (size_t)n);
-        udpBridge.endPacket();
-    }
+    // Mirror over UDP so a WiFi-only host also gets the reply. Goes through
+    // sendToHost() so it picks up the auth wrap.
+    sendToHost(reinterpret_cast<const uint8_t*>(json), (size_t)n);
 #endif
 }
 
@@ -469,7 +580,27 @@ static void handleConfigBody(const uint8_t* body, uint16_t len) {
         replyConfigOk();
 #ifdef USE_WIFI_BRIDGE
     } else if (body[0] == 'W' && body[1] == 'C') {
+        // WiFi creds must come over the trusted USB channel only — otherwise
+        // anyone on the LAN with the UDP key could redirect us to a hostile AP.
+        if (g_parserOnUdp) {
+            Serial.println("#cfg WC refused: not allowed over UDP");
+            return;
+        }
         handleWifiConfig(body + 2, len - 2);
+        replyConfigOk();
+    } else if (body[0] == 'A' && body[1] == 'K') {
+        if (g_parserOnUdp) {
+            Serial.println("#cfg AK refused: not allowed over UDP");
+            return;
+        }
+        handleAuthKeyConfig(body + 2, len - 2);
+        replyConfigOk();
+    } else if (body[0] == 'H' && body[1] == 'A') {
+        if (g_parserOnUdp) {
+            Serial.println("#cfg HA refused: not allowed over UDP");
+            return;
+        }
+        handleHttpAuthConfig(body + 2, len - 2);
         replyConfigOk();
 #endif
     }
@@ -629,7 +760,16 @@ static String renderIndex() {
     return html;
 }
 
+static bool httpRequireAuth(void) {
+    if (!http.authenticate(httpUser.c_str(), httpPass.c_str())) {
+        http.requestAuthentication(BASIC_AUTH, "helionet", "auth required");
+        return false;
+    }
+    return true;
+}
+
 static void httpStats() {
+    if (!httpRequireAuth()) return;
     char buf[480];
     snprintf(buf, sizeof(buf),
         "{\"mode\":\"%s\",\"freqMHz\":%.3f,\"txCount\":%lu,\"rxCount\":%lu,"
@@ -642,6 +782,7 @@ static void httpStats() {
 }
 
 static void httpDisplay() {
+    if (!httpRequireAuth()) return;
     if (http.hasArg("t")) {
         const String& t = http.arg("t");
         size_t n = t.length();
@@ -660,6 +801,63 @@ static void loadWifiConfig(void) {
     cfgPass = wifiPrefs.getString("pass", WIFI_PASS);
     cfgHost = wifiPrefs.getString("host", WIFI_HOSTNAME);
     wifiPrefs.end();
+}
+
+// Load HMAC key + HTTP creds from NVS; generate-and-persist if missing.
+// Prints both on Serial at every boot so the operator can re-read them
+// without having to dig in NVS.
+static void loadOrInitSecrets(void) {
+    wifiPrefs.begin("helio-wifi", true);
+    size_t got = wifiPrefs.getBytesLength("udpkey");
+    if (got == UDP_AUTH_KEY_LEN) {
+        wifiPrefs.getBytes("udpkey", udpAuthKey, UDP_AUTH_KEY_LEN);
+        udpAuthSet = true;
+    }
+    httpUser = wifiPrefs.getString("httpuser", "");
+    httpPass = wifiPrefs.getString("httppass", "");
+    wifiPrefs.end();
+
+    bool writeBack = false;
+    if (!udpAuthSet) {
+        esp_fill_random(udpAuthKey, UDP_AUTH_KEY_LEN);
+        udpAuthSet = true;
+        writeBack = true;
+    }
+    if (httpUser.length() == 0) {
+        httpUser = "admin";
+        writeBack = true;
+    }
+    if (httpPass.length() == 0) {
+        // 16-char URL-safe random password.
+        static const char alpha[] =
+            "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+        char buf[17];
+        for (int i = 0; i < 16; i++) {
+            buf[i] = alpha[esp_random() % (sizeof(alpha) - 1)];
+        }
+        buf[16] = '\0';
+        httpPass = buf;
+        writeBack = true;
+    }
+    if (writeBack) {
+        wifiPrefs.begin("helio-wifi", false);
+        wifiPrefs.putBytes("udpkey", udpAuthKey, UDP_AUTH_KEY_LEN);
+        wifiPrefs.putString("httpuser", httpUser);
+        wifiPrefs.putString("httppass", httpPass);
+        wifiPrefs.end();
+    }
+
+    // Echo secrets so a fresh flash is operable straight from a serial
+    // monitor without extra tooling.
+    Serial.print("#auth udpkey(hex)=");
+    for (size_t i = 0; i < UDP_AUTH_KEY_LEN; i++) Serial.printf("%02x", udpAuthKey[i]);
+    Serial.println();
+    Serial.printf("#auth http user='%s' pass='%s'\n",
+                  httpUser.c_str(), httpPass.c_str());
+
+    mySessionId = esp_random();
+    myOutSeq = 0;
+    peerSessionSeen = false;
 }
 
 static void saveWifiConfig(const String& ssid, const String& pass, const String& host) {
@@ -699,6 +897,49 @@ static bool connectWifi(void) {
     return true;
 }
 
+// CMD_CONFIG "AK" body = exactly 32 raw key bytes. Persists in NVS and takes
+// effect immediately for the *next* outgoing/incoming UDP packet. Existing
+// peer session state is reset so a single key change doesn't cause replay
+// false-positives.
+static void handleAuthKeyConfig(const uint8_t* body, uint16_t len) {
+    if (len != UDP_AUTH_KEY_LEN) {
+        Serial.printf("#cfg AK bad len=%u (want %u)\n",
+                      (unsigned)len, (unsigned)UDP_AUTH_KEY_LEN);
+        return;
+    }
+    memcpy(udpAuthKey, body, UDP_AUTH_KEY_LEN);
+    udpAuthSet = true;
+    wifiPrefs.begin("helio-wifi", false);
+    wifiPrefs.putBytes("udpkey", udpAuthKey, UDP_AUTH_KEY_LEN);
+    wifiPrefs.end();
+    peerSessionSeen = false;
+    myOutSeq = 0;
+    mySessionId = esp_random();
+    Serial.println("#cfg AK installed");
+}
+
+// CMD_CONFIG "HA" body = u8 user_len + user + u8 pass_len + pass.
+static void handleHttpAuthConfig(const uint8_t* body, uint16_t len) {
+    if (len < 2) return;
+    size_t off = 0;
+    uint8_t userLen = body[off++];
+    if (userLen == 0 || userLen > HTTP_CRED_MAX || off + userLen + 1 > len) return;
+    String user(reinterpret_cast<const char*>(body + off), userLen);
+    off += userLen;
+    uint8_t passLen = body[off++];
+    if (passLen == 0 || passLen > HTTP_CRED_MAX || off + passLen > len) return;
+    String pass(reinterpret_cast<const char*>(body + off), passLen);
+
+    httpUser = user;
+    httpPass = pass;
+    wifiPrefs.begin("helio-wifi", false);
+    wifiPrefs.putString("httpuser", httpUser);
+    wifiPrefs.putString("httppass", httpPass);
+    wifiPrefs.end();
+    Serial.printf("#cfg HA installed: user='%s' pass=%u chars\n",
+                  httpUser.c_str(), (unsigned)httpPass.length());
+}
+
 static void handleWifiConfig(const uint8_t* body, uint16_t len) {
     // Body format: u8 ssid_len + ssid + u8 pass_len + pass + u8 host_len + host
     if (len < 3) return;
@@ -736,6 +977,7 @@ static void handleWifiConfig(const uint8_t* body, uint16_t len) {
 
 static void initBridgeWifi(void) {
     loadWifiConfig();
+    loadOrInitSecrets();
     if (!connectWifi()) {
         // Without WiFi the UDP listener is useless, but the parser stays alive
         // over Serial so the host can still push a WC config to us.
@@ -745,7 +987,10 @@ static void initBridgeWifi(void) {
     udpBridge.begin(BRIDGE_UDP_PORT);
     Serial.printf("#udp listening on %d\n", BRIDGE_UDP_PORT);
 
-    http.on("/", []() { http.send(200, "text/html", renderIndex()); });
+    http.on("/", []() {
+        if (!httpRequireAuth()) return;
+        http.send(200, "text/html", renderIndex());
+    });
     http.on("/stats", httpStats);
     http.on("/display", HTTP_POST, httpDisplay);
     http.begin();
@@ -756,12 +1001,53 @@ static void pumpBridge(void) {
     if (!wifiOk) return;
     int sz = udpBridge.parsePacket();
     if (sz > 0) {
-        // Remember who's talking to us so reply frames can find their way back.
-        hostIp = udpBridge.remoteIP();
-        hostPort = udpBridge.remotePort();
         uint8_t buf[1500];
         int n = udpBridge.read(buf, sizeof(buf));
-        for (int i = 0; i < n; i++) feedParser(buf[i]);
+        IPAddress src = udpBridge.remoteIP();
+        uint16_t srcPort = udpBridge.remotePort();
+
+        // Reject anything that's too short to carry a valid auth wrapper
+        // before touching the parser. Also reject if no key is installed yet
+        // (loadOrInitSecrets() always installs one, so this is just defence
+        // in depth).
+        if (!udpAuthSet || n < (int)UDP_AUTH_OVERHEAD) {
+            Serial.printf("#udp drop short n=%d\n", n);
+        } else {
+            uint32_t session =
+                (uint32_t)buf[0] |
+                ((uint32_t)buf[1] << 8) |
+                ((uint32_t)buf[2] << 16) |
+                ((uint32_t)buf[3] << 24);
+            uint32_t seq =
+                (uint32_t)buf[4] |
+                ((uint32_t)buf[5] << 8) |
+                ((uint32_t)buf[6] << 16) |
+                ((uint32_t)buf[7] << 24);
+            size_t payloadLen = (size_t)n - UDP_AUTH_OVERHEAD;
+            const uint8_t* payload = buf + UDP_AUTH_HDR_LEN;
+            const uint8_t* gotTag  = buf + UDP_AUTH_HDR_LEN + payloadLen;
+
+            uint8_t wantTag[UDP_AUTH_TAG_LEN];
+            udpAuthTag(buf, seq, payload, payloadLen, wantTag);
+
+            if (!udpAuthTagEqual(gotTag, wantTag)) {
+                Serial.printf("#udp drop bad-mac from %s:%u\n",
+                              src.toString().c_str(), srcPort);
+            } else if (!udpReplayAccept(session, seq)) {
+                Serial.printf("#udp drop replay session=%08x seq=%u\n",
+                              (unsigned)session, (unsigned)seq);
+            } else {
+                // Auth + replay OK -> the packet is genuinely from a peer
+                // who knows the key. Update the reply target and feed the
+                // parser. Empty payloads (wake-up packets) just refresh the
+                // reply target without doing parser work.
+                hostIp = src;
+                hostPort = srcPort;
+                g_parserOnUdp = true;
+                for (size_t i = 0; i < payloadLen; i++) feedParser(payload[i]);
+                g_parserOnUdp = false;
+            }
+        }
     }
     http.handleClient();
 }

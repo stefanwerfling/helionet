@@ -7,6 +7,13 @@ import {
     RadioTxConfig,
     calcLoraAirtimeMs,
 } from './types.js';
+import {
+    Seq32ReplayWindow,
+    UDP_AUTH_KEY_LEN,
+    newSessionId,
+    unwrapUdp,
+    wrapUdp,
+} from '../frame/UdpAuth.js';
 
 const CMD_SEND = 0x01;
 const CMD_CONFIG = 0x02;
@@ -21,6 +28,9 @@ export interface WiFiUdpDeviceOptions {
     host: string;
     /** UDP port the firmware listens on. Default 7000. */
     port?: number;
+    /** 32-byte HMAC-SHA256 key shared with the firmware. Required. Provision
+     *  it on the board over USB-CDC via HelionetDevice.setUdpAuthKey(). */
+    authKey: Buffer;
 }
 
 interface ConfigWaiter {
@@ -37,13 +47,17 @@ type Mode = 'closed' | 'normal' | 'configuring';
  * CMD_DISPLAY in, raw radio frame + "CONFIG_OK" out), so Ip2LoraTunnel and the
  * CLI work without changes — only the device constructor differs.
  *
- * The firmware uses the *last* IP:port that talked to it as the reply target,
- * so we need to send at least one packet before the firmware will send anything
- * back. open() does this with a zero-byte UDP packet.
+ * Every UDP packet is authenticated with HMAC-SHA256 (16-byte tag) and tagged
+ * with a per-session id + per-packet sequence counter for replay protection.
+ * The shared 32-byte key must be provisioned on the board over USB first.
  */
 export class WiFiUdpDevice extends EventEmitter implements ILoraDevice {
     private readonly opts: WiFiUdpDeviceOptions;
     private readonly port: number;
+    private readonly authKey: Buffer;
+    private readonly mySession: Buffer = newSessionId();
+    private outSeq = 0;
+    private readonly peerReplay = new Seq32ReplayWindow();
     private socket?: dgram.Socket;
     private mode: Mode = 'closed';
     private configBuffer: Buffer = Buffer.alloc(0);
@@ -54,8 +68,14 @@ export class WiFiUdpDevice extends EventEmitter implements ILoraDevice {
 
     public constructor(opts: WiFiUdpDeviceOptions) {
         super();
+        if (!Buffer.isBuffer(opts.authKey) || opts.authKey.length !== UDP_AUTH_KEY_LEN) {
+            throw new RangeError(
+                `WiFiUdpDevice requires a ${UDP_AUTH_KEY_LEN}-byte authKey`,
+            );
+        }
         this.opts = opts;
         this.port = opts.port ?? 7000;
+        this.authKey = opts.authKey;
     }
 
     public open(): Promise<void> {
@@ -73,13 +93,14 @@ export class WiFiUdpDevice extends EventEmitter implements ILoraDevice {
             s.bind(0, () => {
                 this.socket = s;
                 this.mode = 'normal';
-                // Wake the firmware: a one-byte 'no-op' packet (any byte that's
-                // not 0x01..0x03 is silently dropped by the parser) so it
-                // remembers our reply address.
-                s.send(Buffer.from([0x00]), this.port, this.opts.host, (err) => {
-                    if (err) reject(err);
-                    else { this.emit('open'); resolve(); }
-                });
+                // Wake the firmware so it learns our reply address. We send an
+                // authenticated zero-byte payload — the firmware ignores empty
+                // payloads at the parser level but uses the packet's source
+                // address as the reply target.
+                this.sendUdp(Buffer.alloc(0)).then(
+                    () => { this.emit('open'); resolve(); },
+                    (err) => reject(err),
+                );
             });
         });
     }
@@ -199,9 +220,12 @@ export class WiFiUdpDevice extends EventEmitter implements ILoraDevice {
         await delay(maxAirtimeMs + 2 * airtimeMs * Math.random());
     }
 
-    private sendUdp(buf: Buffer): Promise<void> {
+    private sendUdp(payload: Buffer): Promise<void> {
+        const seq = this.outSeq;
+        this.outSeq = (this.outSeq + 1) >>> 0;
+        const wire = wrapUdp(this.authKey, this.mySession, seq, payload);
         return new Promise((resolve, reject) => {
-            this.socket!.send(buf, this.port, this.opts.host, (err) =>
+            this.socket!.send(wire, this.port, this.opts.host, (err) =>
                 err ? reject(err) : resolve(),
             );
         });
@@ -253,8 +277,24 @@ export class WiFiUdpDevice extends EventEmitter implements ILoraDevice {
     }
 
     private onUdpMessage(msg: Buffer): void {
+        let payload: Buffer;
+        try {
+            const u = unwrapUdp(this.authKey, msg);
+            if (!this.peerReplay.check(u.session, u.seq)) {
+                this.emit('error', new Error(
+                    `UDP replay drop session=${u.session.toString('hex')} seq=${u.seq}`,
+                ));
+                return;
+            }
+            payload = u.payload;
+        } catch (e) {
+            this.emit('error', e as Error);
+            return;
+        }
+        if (payload.length === 0) return;
+
         if (this.mode === 'configuring') {
-            this.configBuffer = Buffer.concat([this.configBuffer, msg]);
+            this.configBuffer = Buffer.concat([this.configBuffer, payload]);
             const idx = this.configBuffer.indexOf(CONFIG_OK);
             if (idx >= 0) {
                 const before = this.configBuffer.subarray(0, idx);
@@ -267,7 +307,7 @@ export class WiFiUdpDevice extends EventEmitter implements ILoraDevice {
             }
             return;
         }
-        this.emitFrameOrLog(msg);
+        this.emitFrameOrLog(payload);
     }
 
     private emitFrameOrLog(buf: Buffer): void {
